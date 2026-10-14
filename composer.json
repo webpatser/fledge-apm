@@ -1,0 +1,77 @@
+{
+    "name": "webpatser/fledge-apm",
+    "description": "Fiber-aware OpenTelemetry tracing for the Fledge framework, exported as OTLP to Elastic APM or any OTel backend.",
+    "keywords": [
+        "fledge",
+        "laravel",
+        "apm",
+        "opentelemetry",
+        "otlp",
+        "tracing",
+        "fibers"
+    ],
+    "homepage": "https://github.com/webpatser/fledge-apm",
+    "license": "MIT",
+    "type": "library",
+    "authors": [
+        {
+            "name": "Christoph Kempen",
+            "email": "christoph@downsized.nl"
+        }
+    ],
+    "require": {
+        "php": "^8.5",
+        "guzzlehttp/guzzle": "^7.9 || ^8.0",
+        "open-telemetry/api": "^1.10",
+        "open-telemetry/context": "^1.5",
+        "open-telemetry/exporter-otlp": "^1.4",
+        "open-telemetry/sdk": "^1.15",
+        "open-telemetry/sem-conv": "^1.0",
+        "revolt/event-loop": "^1.0",
+        "webpatser/fledge-fiber": "^13.36.0.2",
+        "webpatser/fledge-framework": "^13.34"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.30",
+        "livewire/livewire": "^4.0",
+        "orchestra/testbench": "^11.0",
+        "pestphp/pest": "^4.0",
+        "pestphp/pest-plugin-laravel": "^4.0",
+        "phpstan/phpstan": "^2.1.33"
+    },
+    "suggest": {
+        "livewire/livewire": "Required for Livewire component spans (^4.0)"
+    },
+    "autoload": {
+        "psr-4": {
+            "Fledge\\Apm\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Fledge\\Apm\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Fledge\\Apm\\ApmServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "@php vendor/bin/pest",
+        "lint": "@php vendor/bin/pint --test",
+        "analyse": "@php vendor/bin/phpstan analyse"
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true,
+            "php-http/discovery": true,
+            "tbachert/spi": true
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}

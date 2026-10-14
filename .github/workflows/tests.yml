@@ -1,0 +1,80 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, libxml, mbstring, pdo, pdo_sqlite, sqlite3, sockets, pcntl, zip, ffi
+          ini-values: error_reporting=E_ALL
+          tools: composer:v2
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-php8.5-${{ hashFiles('composer.json') }}
+          restore-keys: composer-${{ runner.os }}-php8.5-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Run tests
+        run: vendor/bin/pest
+
+  phpstan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Does not gate merges yet: phpstan.neon (level 5) currently reports 5 errors
+    # in src/Instrumentation (a redundant instanceof and three always-true type
+    # checks, none of them real bugs). Remove continue-on-error once they are
+    # fixed or baselined.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, libxml, mbstring, pdo, pdo_sqlite, sqlite3, sockets, pcntl, zip, ffi
+          tools: composer:v2
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-php8.5-${{ hashFiles('composer.json') }}
+          restore-keys: composer-${{ runner.os }}-php8.5-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Run PHPStan
+        run: vendor/bin/phpstan analyse --no-progress --memory-limit=1G
