@@ -28,8 +28,8 @@
         "open-telemetry/sdk": "^1.15",
         "open-telemetry/sem-conv": "^1.0",
         "revolt/event-loop": "^1.0",
-        "webpatser/fledge-fiber": "^13.36.0.2",
-        "webpatser/fledge-framework": "^13.34"
+        "webpatser/fledge-fiber": "^13.38",
+        "webpatser/fledge-framework": "^13.38"
     },
     "require-dev": {
         "laravel/pint": "^1.30",
