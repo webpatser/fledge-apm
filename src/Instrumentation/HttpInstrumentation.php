@@ -43,7 +43,7 @@ use WeakMap;
  * incomingContext() for the sampled flag).
  *
  * Options (all under `apm.http`):
- * - `trust_traceparent` (bool, default true): continue incoming trace ids.
+ * - `trust_traceparent` (bool, default false): continue incoming trace ids.
  * - `honor_sampled_flag` (bool, default false): let the caller's sampled flag
  *   decide instead of the local sample rate.
  * - `record_client_ip` (bool, default false): `client.address`.
@@ -249,7 +249,7 @@ final class HttpInstrumentation implements Instrumentation
     /**
      * The remote parent from a valid W3C `traceparent` header, if any.
      *
-     * The trace id is continued (unless `apm.http.trust_traceparent` is off),
+     * The trace id is continued only when `apm.http.trust_traceparent` is on,
      * but the caller's sampled flag only decides with
      * `apm.http.honor_sampled_flag`: otherwise the local sample rate decides
      * for the continued trace id, so a public caller cannot force (or
@@ -257,7 +257,7 @@ final class HttpInstrumentation implements Instrumentation
      */
     private function incomingContext(Request $request): ?ContextInterface
     {
-        if (! $this->option('trust_traceparent', true)) {
+        if (! $this->option('trust_traceparent', false)) {
             return null;
         }
 

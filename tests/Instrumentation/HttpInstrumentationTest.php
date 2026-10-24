@@ -229,7 +229,9 @@ it('names an unmatched request without the high-cardinality path', function () {
         ->and($root->getAttributes()->has('http.route'))->toBeFalse();
 });
 
-it('continues an incoming W3C traceparent', function () {
+it('continues an incoming W3C traceparent when trust_traceparent is on', function () {
+    config()->set('apm.http.trust_traceparent', true);
+
     [$tracer, $exporter] = httpApm();
 
     $traceId = str_repeat('ab', 16);
@@ -253,6 +255,7 @@ it('continues an incoming W3C traceparent', function () {
 function contextSeenFor(string $traceparent): SpanContextInterface
 {
     config()->set('apm.sample_rate', 0.0);
+    config()->set('apm.http.trust_traceparent', true);
 
     [$tracer] = memoryTracer(['sample_rate' => 0.0, 'keep' => ['errors' => false, 'slow_ms' => 0]]);
     (new HttpInstrumentation)->register(app(), $tracer);
@@ -291,6 +294,8 @@ it('lets the caller force sampling when honor_sampled_flag is on', function () {
 });
 
 it('samples a continued trace locally even when the caller says not sampled', function () {
+    config()->set('apm.http.trust_traceparent', true);
+
     [$tracer, $exporter] = httpApm();
 
     $traceId = str_repeat('ab', 16);
@@ -307,8 +312,8 @@ it('samples a continued trace locally even when the caller says not sampled', fu
         ->and($root->getParentSpanId())->toBe($parentId);
 });
 
-it('starts a new trace for an incoming traceparent when trust_traceparent is off', function () {
-    config()->set('apm.http.trust_traceparent', false);
+it('starts a new trace for an incoming traceparent by default', function () {
+    expect(config('apm.http.trust_traceparent'))->toBeFalse();
 
     [$tracer, $exporter] = httpApm();
 

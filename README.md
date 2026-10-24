@@ -126,7 +126,7 @@ Query bindings are never sent, request bodies and headers are never recorded, an
 
 Head sampling keeps `APM_SAMPLE_RATE` of new traces. Below 1.0, traces the ratio dropped are still recorded in memory, and are exported anyway when a span failed (`keep.errors`) or the transaction was slow (`keep.slow_ms`). For plain head sampling, set `keep.errors` to `false` and `keep.slow_ms` to `0`; dropped traces then cost almost nothing.
 
-An incoming `traceparent` continues the caller's trace id (`apm.http.trust_traceparent`), but its sampled flag is not honored by default (`apm.http.honor_sampled_flag`), so an outside client cannot force or suppress sampling on your app. Turn it on if the caller is another service you own and you want one sampling decision across both.
+An incoming `traceparent` is ignored by default, so a public client cannot choose your trace ids. Set `apm.http.trust_traceparent` to `true` to continue the caller's trace id when requests come from services you own (or a trusted proxy). Even then its sampled flag is not honored by default (`apm.http.honor_sampled_flag`), so an outside client cannot force or suppress sampling on your app. Turn it on if the caller is another service you own and you want one sampling decision across both.
 
 ## Known limits
 

@@ -19,7 +19,8 @@ return [
     |--------------------------------------------------------------------------
     |
     | Parent-based head sampling: the share of new traces to keep (0.0 - 1.0).
-    | An incoming traceparent decides for its trace.
+    | An incoming HTTP traceparent is ignored unless apm.http.trust_traceparent
+    | is on, and decides for its trace only with apm.http.honor_sampled_flag.
     |
     | Below 1.0, traces the ratio dropped are still recorded and kept when a
     | span failed (keep.errors) or the transaction took at least keep.slow_ms.
@@ -172,9 +173,10 @@ return [
     */
 
     'http' => [
-        // Continue the trace id of an incoming traceparent header. Turn off
-        // when the app is exposed to clients you do not control.
-        'trust_traceparent' => true,
+        // Continue the trace id of an incoming traceparent header. Off by
+        // default so a public caller cannot choose your trace ids. Turn on
+        // when requests come from services you own (or a trusted proxy).
+        'trust_traceparent' => false,
         // Let the caller's sampled flag override the local sample_rate.
         // Off by default so a client cannot force or suppress sampling.
         'honor_sampled_flag' => false,
