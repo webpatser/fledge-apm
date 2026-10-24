@@ -12,7 +12,15 @@ namespace Fledge\Apm\Instrumentation\Support;
  */
 final class UrlRedaction
 {
-    private const string SENSITIVE_QUERY_PARAM = '/token|key|secret|password|passwd|pwd|auth|signature|credential|^sig$/i';
+    private const string SENSITIVE_QUERY_PARAM = '/token|key|secret|password|passwd|pwd|auth|signature|credential/i';
+
+    /**
+     * Names too short or too common to match as a substring: `session` and
+     * `nonce` anywhere, and `code`, `otp`, `state`, `access`, `refresh`, `sig`
+     * as the whole name or its last segment (`oauth_code`, `auth[state]`), so
+     * `postcode`, `barcode`, `statement` and `page` stay readable.
+     */
+    private const string SENSITIVE_NAME_EXTRA = '/session|nonce|(?:^|[_\-.\[])(?:code|otp|state|access|refresh|sig)\]?$/i';
 
     /**
      * Route parameters that are secrets on top of the query-parameter names:
@@ -88,9 +96,15 @@ final class UrlRedaction
         return $result;
     }
 
-    private static function sensitiveRouteParam(string $name): bool
+    private static function sensitiveName(string $name): bool
     {
         return preg_match(self::SENSITIVE_QUERY_PARAM, $name) === 1
+            || preg_match(self::SENSITIVE_NAME_EXTRA, $name) === 1;
+    }
+
+    private static function sensitiveRouteParam(string $name): bool
+    {
+        return self::sensitiveName($name)
             || preg_match(self::SENSITIVE_PATH_PARAM, $name) === 1;
     }
 
@@ -112,7 +126,7 @@ final class UrlRedaction
 
                 [$name] = explode('=', $pair, 2);
 
-                return preg_match(self::SENSITIVE_QUERY_PARAM, rawurldecode($name)) === 1 ? "{$name}=REDACTED" : $pair;
+                return self::sensitiveName(rawurldecode($name)) ? "{$name}=REDACTED" : $pair;
             },
             explode('&', $query),
         ));
