@@ -50,7 +50,9 @@ use WeakMap;
  * - `record_user_agent` (bool, default true): `user_agent.original`.
  * - `record_user_id` (bool, default true): `enduser.id`.
  *
- * `url.query` is recorded with credential-looking values redacted.
+ * `url.query` is recorded with credential-looking values redacted, and so are
+ * the credential-looking parameters of the matched route in `url.path`
+ * (`/reset-password/{token}` is recorded as `/reset-password/REDACTED`).
  */
 final class HttpInstrumentation implements Instrumentation
 {
@@ -170,6 +172,7 @@ final class HttpInstrumentation implements Instrumentation
 
             $active->span->updateName("{$method} {$uri}");
             $active->setAttribute('http.route', $uri);
+            $active->setAttribute('url.path', UrlRedaction::path('/'.ltrim($request->getPathInfo(), '/'), $route->uri()));
 
             if (($name = $route->getName()) !== null) {
                 $active->setAttribute('laravel.route.name', $name);

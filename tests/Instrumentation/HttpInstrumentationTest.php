@@ -141,6 +141,37 @@ it('records url.query with secret-looking values redacted', function () {
         ->not->toContain('abc123');
 });
 
+it('redacts credential-looking route parameters in url.path', function (string $uri, string $requested, string $recorded) {
+    [$tracer, $exporter] = httpApm();
+
+    Route::get($uri, fn () => 'ok');
+
+    $this->get($requested)->assertOk();
+
+    $root = httpSpan(httpExported($tracer, $exporter), 'GET /'.ltrim($uri, '/'));
+
+    expect($root->getAttributes()->get('url.path'))->toBe($recorded)
+        ->and($root->getAttributes()->get('http.route'))->toBe('/'.ltrim($uri, '/'));
+})->with([
+    'reset token' => ['/reset-password/{token}', '/reset-password/s3cr3t-reset', '/reset-password/REDACTED'],
+    'verify hash' => ['/email/verify/{id}/{hash}', '/email/verify/7/0a1b2c3d4e', '/email/verify/7/REDACTED'],
+    'invite token' => ['/invite/{token}/accept', '/invite/abc123/accept', '/invite/REDACTED/accept'],
+    'optional token' => ['/confirm/{token?}', '/confirm/abc123', '/confirm/REDACTED'],
+    'embedded in segment' => ['/magic-{token}', '/magic-abc123', '/magic-REDACTED'],
+    'harmless params stay' => ['/users/{id}/posts/{slug}', '/users/42/posts/hello-world', '/users/42/posts/hello-world'],
+]);
+
+it('leaves the url.path of a route without parameters alone', function () {
+    [$tracer, $exporter] = httpApm();
+
+    Route::get('/token-settings', fn () => 'ok');
+
+    $this->get('/token-settings')->assertOk();
+
+    expect(httpSpan(httpExported($tracer, $exporter), 'GET /token-settings')->getAttributes()->get('url.path'))
+        ->toBe('/token-settings');
+});
+
 it('nests spans started during the request under the transaction', function () {
     [$tracer, $exporter] = httpApm();
 
