@@ -33,14 +33,14 @@
     },
     "require-dev": {
         "laravel/pint": "^1.30",
-        "livewire/livewire": "^4.0",
+        "livewire/livewire": "^4.4.8",
         "orchestra/testbench": "^11.0",
         "pestphp/pest": "^4.0",
         "pestphp/pest-plugin-laravel": "^4.0",
         "phpstan/phpstan": "^2.1.33"
     },
     "suggest": {
-        "livewire/livewire": "Required for Livewire component spans (^4.0)"
+        "livewire/livewire": "Required for Livewire component spans (^4.4.8, earlier 4.x has GHSA-mhf7-xp6r-6qrc)"
     },
     "autoload": {
         "psr-4": {
