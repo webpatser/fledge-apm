@@ -18,6 +18,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `ActiveSpan::recordException()` no longer adds a second `exception` event for an exception that was already recorded elsewhere; it only sets the error status.
 
+### Fixed
+
+- Running out of the flush budget partway through a flush, after the intake accepted an earlier chunk of that flush, no longer opens the shared export breaker; the rest of the batch is dropped and counted. The breaker still opens for a first chunk that exhausts the budget, a failure that returns before the deadline (a 5xx or a connect error, say), a request that runs past the flush deadline, and 3 budget cut-offs in a row on one worker; a flush that exports everything resets that count.
+
 ## [0.1.2] - 2026-10-24
 
 ### Security
