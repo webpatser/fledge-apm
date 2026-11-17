@@ -118,9 +118,22 @@ Spans are only created inside a trace, so a query run by something that has no t
 | `apm.http.record_user_id` | `true` | `enduser.id`. |
 | `apm.options.cache.record_keys` | `false` | Cache keys can hold PII. |
 | `apm.options.database.record_bindings` | `false` | Bindings are stripped from recorded exception messages. |
+| `apm.options.http_client.record_full_path` | `false` | Keeps the path in `url.full` verbatim; see below. |
 | `apm.options.http_client.error_on_4xx` | `false` | Only 5xx and transport errors mark a client span as failed. |
 
 Query bindings are never sent, request bodies and headers are never recorded, and outgoing URLs are redacted.
+
+### Outgoing URL paths
+
+`url.full` on client spans drops userinfo and the fragment, and redacts credential-looking query values. Secrets carried in the path are replaced by `REDACTED` too: Telegram bot tokens (`/botREDACTED/sendMessage`), Slack and Discord webhook secrets, and any segment with a random-looking run of 32 or more characters (JWTs, percent-encoded base64 and segments with matrix params included).
+
+UUIDs, version strings and ordinary file names stay readable. 32+ character hex identifiers such as Git SHAs, MD5 object keys and Gravatar hashes are hidden. Set `apm.options.http_client.record_full_path` to `true` to get the old behaviour back and export the path verbatim; it applies to the whole app, and userinfo and query redaction still apply.
+
+Limits, stated plainly:
+
+- A path secret shorter than 32 characters outside the known Telegram, Slack and Discord shapes is exported as is.
+- A wrapper exception that rewords the SQL message instead of including it verbatim still exports what it wrote.
+- The database driver's own message is kept, so a message such as `Duplicate entry 'jane@example.test' for key ...` still contains the value.
 
 ## Sampling
 
