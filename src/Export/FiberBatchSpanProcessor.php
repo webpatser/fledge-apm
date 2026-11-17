@@ -40,6 +40,22 @@ use Throwable;
  */
 final class FiberBatchSpanProcessor implements SpanProcessorInterface
 {
+    /**
+     * A request whose timeout was capped to the deadline can end slightly
+     * before or after it (millisecond timeout granularity, event loop timers).
+     */
+    private const int BUDGET_SLACK_NANOS = 10_000_000;
+
+    /**
+     * Consecutive flushes cut off by the budget before the breaker opens. One
+     * or two can be a single large request (an N+1 page) against a healthy
+     * intake; three in a row on the same worker mean ordinary flushes do not
+     * fit the budget. That bounds a slow but alive intake to three full
+     * budgets per worker per breaker window, and the breaker is shared, so
+     * the first worker to get there pauses all of them.
+     */
+    private const int MAX_BUDGET_CUT_OFFS = 3;
+
     /** @var list<SpanDataInterface> spans ready for export */
     private array $ready = [];
 
@@ -55,6 +71,9 @@ final class FiberBatchSpanProcessor implements SpanProcessorInterface
     private int $pendingCount = 0;
 
     private int $dropped = 0;
+
+    /** consecutive flushes that ended in a budget cut-off, reset by a full export */
+    private int $budgetCutOffs = 0;
 
     private bool $closed = false;
 
@@ -177,8 +196,9 @@ final class FiberBatchSpanProcessor implements SpanProcessorInterface
 
     /**
      * Export the buffer in chunks within the deadline. The first failed chunk
-     * opens the breaker and drops the rest: a struggling intake gets no more
-     * requests from this flush. Spans that were not exported count as dropped.
+     * drops the rest and, unless the flush only ran out of budget, opens the
+     * breaker: a struggling intake gets no more requests from this flush.
+     * Spans that were not exported count as dropped.
      */
     private function export(ExportDeadline $deadline): bool
     {
@@ -204,6 +224,8 @@ final class FiberBatchSpanProcessor implements SpanProcessorInterface
                 break;
             }
 
+            $startedAt = hrtime(true);
+
             try {
                 $exported = $this->exporter->export($chunk, $deadline)->await();
             } catch (Throwable) {
@@ -211,7 +233,7 @@ final class FiberBatchSpanProcessor implements SpanProcessorInterface
             }
 
             if (! $exported) {
-                $this->breaker?->recordFailure();
+                $this->recordFailedChunk($deadline, $startedAt, hrtime(true), count($batch) - $remaining);
 
                 break;
             }
@@ -221,7 +243,54 @@ final class FiberBatchSpanProcessor implements SpanProcessorInterface
 
         $this->dropped += $remaining;
 
+        if ($remaining === 0) {
+            $this->budgetCutOffs = 0;
+        }
+
         return $remaining === 0;
+    }
+
+    /**
+     * A failed chunk opens the breaker, unless this flush's own budget cut it
+     * off. Budget cut-offs only open it once they repeat: a slow but alive
+     * intake must not cost every flush its full budget forever.
+     */
+    private function recordFailedChunk(ExportDeadline $deadline, int $startedAt, int $endedAt, int $exported): void
+    {
+        if (! $this->cutOffByBudget($deadline, $startedAt, $endedAt, $exported)) {
+            $this->budgetCutOffs = 0;
+            $this->breaker?->recordFailure();
+
+            return;
+        }
+
+        if (++$this->budgetCutOffs >= self::MAX_BUDGET_CUT_OFFS) {
+            $this->budgetCutOffs = 0;
+            $this->breaker?->recordFailure();
+        }
+    }
+
+    /**
+     * Whether a failed chunk was the transport's budget-capped timeout rather
+     * than a failure of the intake:
+     * - the intake already accepted earlier chunks of this flush (a first
+     *   chunk that outlasts the whole budget is a stalled intake);
+     * - the request ran until the deadline: its elapsed time reached the
+     *   budget it was given, within the slack (a fast 5xx or connect error
+     *   near the deadline is the intake's failure);
+     * - it did not end later than the slack past the deadline (a client
+     *   without a capped timeout, which hung on its own, is not excused).
+     */
+    private function cutOffByBudget(ExportDeadline $deadline, int $startedAt, int $endedAt, int $exported): bool
+    {
+        $given = $deadline->deadlineNanos - $startedAt;
+        $elapsed = $endedAt - $startedAt;
+        $slack = self::BUDGET_SLACK_NANOS;
+
+        return $exported > 0
+            && $given > 0
+            && $elapsed >= max($given - $slack, intdiv($given, 2))
+            && $endedAt - $deadline->deadlineNanos <= $slack;
     }
 
     private function enqueue(SpanDataInterface $span): void
