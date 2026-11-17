@@ -46,6 +46,10 @@ use WeakMap;
  * - `error_on_4xx` (bool, default false): also mark 4xx responses as ERROR.
  *   By default only 5xx responses and connection failures are errors; a 404
  *   from an API is usually an answer, not a failure of this service.
+ * - `record_full_path` (bool, default false): keep the URL path in `url.full`
+ *   verbatim. By default credentials carried in the path (Telegram bot
+ *   tokens, Slack and Discord webhook secrets, long random segments) are
+ *   replaced by REDACTED.
  *
  * Requests outside any trace are neither recorded nor given trace headers.
  * The package's own OTLP exporter does not use the Http client, so exports
@@ -56,6 +60,8 @@ final class HttpClientInstrumentation implements Instrumentation
     private bool $propagate = true;
 
     private bool $errorOn4xx = false;
+
+    private bool $recordFullPath = false;
 
     /** @var WeakMap<Factory, true> */
     private WeakMap $patched;
@@ -69,6 +75,7 @@ final class HttpClientInstrumentation implements Instrumentation
     {
         $this->propagate = (bool) $app['config']->get('apm.options.http_client.propagate', true);
         $this->errorOn4xx = (bool) $app['config']->get('apm.options.http_client.error_on_4xx', false);
+        $this->recordFullPath = (bool) $app['config']->get('apm.options.http_client.record_full_path', false);
 
         $install = function (Factory $factory) use ($tracer): void {
             if (isset($this->patched[$factory])) {
@@ -108,7 +115,7 @@ final class HttpClientInstrumentation implements Instrumentation
             kind: SpanKind::KIND_CLIENT,
             attributes: array_filter([
                 'http.request.method' => $method,
-                'url.full' => self::url($uri),
+                'url.full' => $this->url($uri),
                 'server.address' => $host,
                 'server.port' => $uri->getPort() ?? match ($uri->getScheme()) {
                     'https' => 443,
@@ -206,12 +213,20 @@ final class HttpClientInstrumentation implements Instrumentation
     }
 
     /**
-     * The request URL without user info and fragment, and with the value of
+     * The request URL without user info and fragment, with the value of
      * credential-looking query parameters (token, key, secret, signature, ...)
-     * replaced by REDACTED.
+     * replaced by REDACTED, and, unless `record_full_path` is on, with
+     * credentials carried in the path (bot tokens, webhook secrets, long
+     * random segments) replaced by REDACTED.
      */
-    private static function url(UriInterface $uri): string
+    private function url(UriInterface $uri): string
     {
-        return (string) $uri->withUserInfo('')->withQuery(UrlRedaction::query($uri->getQuery()))->withFragment('');
+        $uri = $uri->withUserInfo('')->withQuery(UrlRedaction::query($uri->getQuery()))->withFragment('');
+
+        if (! $this->recordFullPath) {
+            $uri = $uri->withPath(UrlRedaction::clientPath($uri->getPath(), $uri->getHost()));
+        }
+
+        return (string) $uri;
     }
 }

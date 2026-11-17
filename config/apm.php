@@ -216,6 +216,10 @@ return [
             'propagate' => true,
             // Mark 4xx responses as span errors (5xx always are).
             'error_on_4xx' => false,
+            // Keep the URL path in url.full verbatim. Off by default: tokens
+            // in the path (Telegram bots, Slack and Discord webhooks, long
+            // random segments) are replaced by REDACTED.
+            'record_full_path' => false,
         ],
     ],
 

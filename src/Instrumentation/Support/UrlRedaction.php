@@ -6,7 +6,8 @@ namespace Fledge\Apm\Instrumentation\Support;
 
 /**
  * Query string redaction shared by the incoming (`url.query`) and outgoing
- * (`url.full`) HTTP instrumentations.
+ * (`url.full`) HTTP instrumentations, plus path redaction for both: by route
+ * template for incoming requests, by known secret shapes for outgoing ones.
  *
  * @internal
  */
@@ -56,6 +57,109 @@ final class UrlRedaction
         }
 
         return '/'.implode('/', $pathSegments);
+    }
+
+    /**
+     * The path of an outgoing request with credentials that APIs carry in the
+     * path replaced by REDACTED. There is no route template to go by, so this
+     * matches known shapes plus a heuristic:
+     *
+     * - Telegram bot API: `/bot<id>:<token>/...` becomes `/botREDACTED/...`.
+     * - Slack incoming webhooks (`hooks.slack.com`): every segment after the
+     *   first (`/services/REDACTED/REDACTED/REDACTED`).
+     * - Discord webhooks (`discord.com`, `discordapp.com`): the token after
+     *   `webhooks/<id>`.
+     * - Any segment holding a random-looking run of 32 or more token
+     *   characters (hex digests, API keys, base64, JWTs), judged on the
+     *   percent-decoded segment; see randomPart().
+     *
+     * @param  string  $path  the request path, e.g. `/bot123:AAE.../sendMessage`
+     * @param  string  $host  the request host, e.g. `api.telegram.org`
+     */
+    public static function clientPath(string $path, string $host = ''): string
+    {
+        if ($path === '' || $path === '/') {
+            return $path;
+        }
+
+        $host = strtolower($host);
+        $segments = explode('/', $path);
+        $slack = $host === 'hooks.slack.com';
+        $discord = in_array(preg_replace('/^(?:ptb\.|canary\.)/', '', $host), ['discord.com', 'discordapp.com'], true);
+        $first = true;
+
+        foreach ($segments as $index => $segment) {
+            if ($segment === '') {
+                continue;
+            }
+
+            $decoded = rawurldecode($segment);
+
+            if (preg_match('/^bot\d+:[\w\-]+$/', $decoded) === 1) {
+                $segments[$index] = 'botREDACTED';
+            } elseif ($slack && ! $first) {
+                $segments[$index] = 'REDACTED';
+            } elseif ($discord && $index >= 2 && strtolower($segments[$index - 2]) === 'webhooks' && ctype_digit($segments[$index - 1])) {
+                $segments[$index] = 'REDACTED';
+            } elseif (self::randomLooking($decoded)) {
+                $segments[$index] = 'REDACTED';
+            }
+
+            $first = false;
+        }
+
+        return implode('/', $segments);
+    }
+
+    /**
+     * Whether any part of the decoded segment looks like a secret. The
+     * segment is split on characters outside the base64, base64url and JWT
+     * alphabets (`;` matrix parameters, `,`, spaces, ...), so `<hex>;v=1`
+     * is judged by its hex part.
+     */
+    private static function randomLooking(string $segment): bool
+    {
+        if (strlen($segment) < 32) {
+            return false;
+        }
+
+        $parts = preg_split('#[^\w\-.+/=~]+#', $segment, -1, PREG_SPLIT_NO_EMPTY);
+
+        foreach (is_array($parts) ? $parts : [] as $part) {
+            if (self::randomPart($part)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * A run of 32 or more token characters that is either letters and digits
+     * only with at least one of each (hex digests, API keys), or mixes upper
+     * case, lower case and digits with an upper case letter inside a word
+     * (base64, base64url, JWT). UUIDs, slugs, versions, dotted file names and
+     * Title-Case-Words stay readable.
+     */
+    private static function randomPart(string $part): bool
+    {
+        if (strlen($part) < 32) {
+            return false;
+        }
+
+        if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $part) === 1) {
+            return false;
+        }
+
+        $digit = preg_match('/\d/', $part) === 1;
+        $lower = preg_match('/[a-z]/', $part) === 1;
+        $upper = preg_match('/[A-Z]/', $part) === 1;
+
+        if (ctype_alnum($part)) {
+            return $digit && ($lower || $upper);
+        }
+
+        return $digit && $lower && $upper && preg_match('/[a-z0-9][A-Z]/', $part) === 1;
     }
 
     private static function redactSegment(string $template, string $segment): string

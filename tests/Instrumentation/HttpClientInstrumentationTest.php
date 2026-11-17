@@ -158,6 +158,45 @@ it('strips credentials and redacts secret-looking query values from url.full', f
         ->and($url)->not->toContain('abc123');
 });
 
+it('redacts credentials carried in the path from url.full', function () {
+    [$tracer, $exporter] = httpTracer();
+    $sent = null;
+
+    Http::fake(function (Request $request) use (&$sent) {
+        $sent = $request->url();
+
+        return Http::response('ok');
+    });
+
+    $parent = $tracer->startSpan('GET /');
+    Http::post('https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage?chat_id=7');
+    $parent->end();
+
+    [$span] = httpSpans($tracer, $exporter);
+
+    expect($span->getAttributes()->get('url.full'))->toBe('https://api.telegram.org/botREDACTED/sendMessage?chat_id=7')
+        ->and($span->getName())->toBe('POST api.telegram.org')
+        // The request itself is untouched.
+        ->and($sent)->toContain('AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw');
+});
+
+it('keeps the path in url.full verbatim when record_full_path is on', function () {
+    config()->set('apm.options.http_client.record_full_path', true);
+
+    [$tracer, $exporter] = httpTracer();
+
+    Http::fake(['*' => Http::response('ok')]);
+
+    $parent = $tracer->startSpan('GET /');
+    $hook = 'https://hooks.slack.com/'.'services/'.implode('/', ['T00000000', 'B00000000', str_repeat('X', 24)]);
+    Http::post($hook.'?token=t');
+    $parent->end();
+
+    [$span] = httpSpans($tracer, $exporter);
+
+    expect($span->getAttributes()->get('url.full'))->toBe($hook.'?token=REDACTED');
+});
+
 it('does not trace or touch requests sent outside a trace', function () {
     [$tracer, $exporter] = httpTracer();
     $seen = 'unset';
