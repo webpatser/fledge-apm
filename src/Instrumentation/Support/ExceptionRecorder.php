@@ -22,7 +22,9 @@ use WeakMap;
  * - Privacy: a QueryException message interpolates the bindings into the SQL.
  *   Unless `apm.options.database.record_bindings` is on, the recorded message
  *   (event message, stack trace header and status description) is the driver
- *   message plus the SQL with its `?` placeholders.
+ *   message plus the SQL with its `?` placeholders. This also holds for a
+ *   QueryException wrapped by another exception (a ViewException carries its
+ *   message, the stack trace its `Caused by` line).
  *
  * @internal
  */
@@ -77,31 +79,23 @@ final class ExceptionRecorder
      */
     public static function message(Throwable $exception): string
     {
-        if (! $exception instanceof QueryException || self::recordBindings()) {
-            return $exception->getMessage();
-        }
+        $replacements = self::replacements($exception);
 
-        $driver = $exception->getPrevious()?->getMessage();
-
-        if ($driver === null || $driver === '') {
-            $driver = 'SQLSTATE['.$exception->getCode().']';
-        }
-
-        return sprintf('%s (Connection: %s, SQL: %s)', $driver, $exception->getConnectionName(), $exception->getSql());
+        return $replacements === [] ? $exception->getMessage() : strtr($exception->getMessage(), $replacements);
     }
 
     /**
-     * Event attributes overriding the SDK defaults when the message had to be
-     * redacted.
+     * Event attributes overriding the SDK defaults when the message or the
+     * stack trace (its `Caused by` chain) had to be redacted.
      *
      * @return array<non-empty-string, string>
      */
     private static function attributes(Throwable $exception): array
     {
         $message = self::message($exception);
-        $original = $exception->getMessage();
+        $replacements = self::replacements($exception);
 
-        if ($message === $original) {
+        if ($replacements === [] && $message === $exception->getMessage()) {
             return [];
         }
 
@@ -109,8 +103,68 @@ final class ExceptionRecorder
 
         return [
             'exception.message' => $message,
-            'exception.stacktrace' => $original === '' ? $trace : str_replace($original, $message, $trace),
+            'exception.stacktrace' => $replacements === [] ? $trace : strtr($trace, $replacements),
         ];
+    }
+
+    /**
+     * The interpolated message of every QueryException in the chain (the
+     * exception itself and its previous exceptions, such as the QueryException
+     * a ViewException wraps) mapped to its placeholder form. Empty when
+     * bindings may be recorded or the chain holds no QueryException.
+     *
+     * Built from the innermost exception outwards, so a QueryException whose
+     * driver message is itself a QueryException (or a wrapper around one)
+     * gets that inner message redacted too.
+     *
+     * @return array<string, string>
+     */
+    private static function replacements(Throwable $exception): array
+    {
+        $chain = [];
+        $hasQuery = false;
+
+        for ($current = $exception; $current !== null && ! isset($chain[spl_object_id($current)]); $current = $current->getPrevious()) {
+            $chain[spl_object_id($current)] = $current;
+            $hasQuery = $hasQuery || $current instanceof QueryException;
+        }
+
+        if (! $hasQuery || self::recordBindings()) {
+            return [];
+        }
+
+        $replacements = [];
+
+        foreach (array_reverse($chain) as $current) {
+            if (! $current instanceof QueryException) {
+                continue;
+            }
+
+            $original = $current->getMessage();
+            $redacted = self::redactedQueryMessage($current, $replacements);
+
+            if ($original !== '' && $original !== $redacted) {
+                $replacements[$original] = $redacted;
+            }
+        }
+
+        return $replacements;
+    }
+
+    /**
+     * @param  array<string, string>  $inner  replacements for the exceptions below this one
+     */
+    private static function redactedQueryMessage(QueryException $exception, array $inner): string
+    {
+        $driver = $exception->getPrevious()?->getMessage();
+
+        if ($driver === null || $driver === '') {
+            $driver = 'SQLSTATE['.$exception->getCode().']';
+        } elseif ($inner !== []) {
+            $driver = strtr($driver, $inner);
+        }
+
+        return sprintf('%s (Connection: %s, SQL: %s)', $driver, $exception->getConnectionName(), $exception->getSql());
     }
 
     private static function recordBindings(): bool

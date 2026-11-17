@@ -7,6 +7,7 @@ use Fledge\Apm\Instrumentation\Support\ExceptionRecorder;
 use Fledge\Apm\Tracer;
 use Illuminate\Database\QueryException;
 use Illuminate\Validation\ValidationException;
+use Illuminate\View\ViewException;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
 use OpenTelemetry\SDK\Trace\SpanDataInterface;
@@ -158,6 +159,143 @@ it('records the QueryException message with bindings when record_bindings is on'
 
     expect($attributes->get('exception.message'))->toBe($exception->getMessage())
         ->and($attributes->get('exception.message'))->toContain('jane@example.test');
+});
+
+it('records a QueryException wrapped in a ViewException without its bindings', function () {
+    [$tracer, $exporter] = exceptionTracer();
+
+    $root = $tracer->startSpan('GET /users', SpanKind::KIND_SERVER);
+    $query = failedQuery();
+
+    report(new ViewException($query->getMessage().' (View: /app/resources/views/users.blade.php)', 0, 1, __FILE__, __LINE__, $query));
+
+    $root->end();
+
+    $span = exceptionSpansByName($tracer, $exporter)['GET /users'];
+    $attributes = $span->getEvents()[0]->getAttributes();
+    $redacted = "SQLSTATE[42S02]: Base table or view not found: 1146 Table 'app.users' doesn't exist (Connection: mysql, SQL: select * from users where email = ? and pin = ?)";
+
+    expect($attributes->get('exception.type'))->toBe(ViewException::class)
+        ->and($attributes->get('exception.message'))->toBe($redacted.' (View: /app/resources/views/users.blade.php)')
+        ->and($attributes->get('exception.stacktrace'))->toContain('Caused by: Illuminate.Database.QueryException: '.$redacted)
+        ->and($span->getStatus()->getDescription())->toBe($redacted.' (View: /app/resources/views/users.blade.php)');
+
+    foreach ([$attributes->get('exception.message'), $attributes->get('exception.stacktrace'), $span->getStatus()->getDescription()] as $value) {
+        expect($value)->not->toContain('jane@example.test')->not->toContain('4321');
+    }
+});
+
+it('redacts the Caused by line of a QueryException behind a wrapper with its own message', function () {
+    [$tracer, $exporter] = exceptionTracer();
+
+    $root = $tracer->startSpan('GET /users', SpanKind::KIND_SERVER);
+
+    report(new RuntimeException('Rendering failed', 0, failedQuery()));
+
+    $root->end();
+
+    $span = exceptionSpansByName($tracer, $exporter)['GET /users'];
+    $attributes = $span->getEvents()[0]->getAttributes();
+
+    expect($attributes->get('exception.message'))->toBe('Rendering failed')
+        ->and($attributes->get('exception.stacktrace'))->toContain('SQL: select * from users where email = ? and pin = ?')
+        ->and($attributes->get('exception.stacktrace'))->not->toContain('jane@example.test')->not->toContain('4321');
+});
+
+it('keeps the bindings of a wrapped QueryException when record_bindings is on', function () {
+    config()->set('apm.options.database.record_bindings', true);
+
+    [$tracer, $exporter] = exceptionTracer();
+
+    $root = $tracer->startSpan('GET /users', SpanKind::KIND_SERVER);
+    $query = failedQuery();
+
+    report(new ViewException($query->getMessage(), 0, 1, __FILE__, __LINE__, $query));
+
+    $root->end();
+
+    $attributes = exceptionSpansByName($tracer, $exporter)['GET /users']->getEvents()[0]->getAttributes();
+
+    expect($attributes->get('exception.message'))->toContain('jane@example.test');
+});
+
+it('redacts a QueryException three levels deep', function () {
+    [$tracer, $exporter] = exceptionTracer();
+
+    $root = $tracer->startSpan('GET /users', SpanKind::KIND_SERVER);
+    $query = failedQuery();
+    $inner = new ViewException($query->getMessage().' (View: /app/views/row.blade.php)', 0, 1, __FILE__, __LINE__, $query);
+
+    report(new ViewException($inner->getMessage().' (View: /app/views/users.blade.php)', 0, 1, __FILE__, __LINE__, $inner));
+
+    $root->end();
+
+    $span = exceptionSpansByName($tracer, $exporter)['GET /users'];
+    $attributes = $span->getEvents()[0]->getAttributes();
+    $redacted = "SQLSTATE[42S02]: Base table or view not found: 1146 Table 'app.users' doesn't exist (Connection: mysql, SQL: select * from users where email = ? and pin = ?)";
+
+    expect($attributes->get('exception.message'))->toBe($redacted.' (View: /app/views/row.blade.php) (View: /app/views/users.blade.php)')
+        ->and($attributes->get('exception.stacktrace'))->toContain('Caused by: Illuminate.View.ViewException: '.$redacted.' (View: /app/views/row.blade.php)')
+        ->and($attributes->get('exception.stacktrace'))->toContain('Caused by: Illuminate.Database.QueryException: '.$redacted);
+
+    foreach ([$attributes->get('exception.message'), $attributes->get('exception.stacktrace'), $span->getStatus()->getDescription()] as $value) {
+        expect($value)->not->toContain('jane@example.test')->not->toContain('4321');
+    }
+});
+
+it('redacts a QueryException at the top that wraps another QueryException', function () {
+    [$tracer, $exporter] = exceptionTracer();
+
+    $root = $tracer->startSpan('GET /users', SpanKind::KIND_SERVER);
+    $nested = new QueryException(
+        'mysql',
+        'select * from tokens where secret = ?',
+        ['s3cr3t-value'],
+        new PDOException('SQLSTATE[HY000]: General error'),
+    );
+
+    report(new QueryException('mysql', 'select * from users where email = ? and pin = ?', ['jane@example.test', 4321], $nested));
+
+    $root->end();
+
+    $span = exceptionSpansByName($tracer, $exporter)['GET /users'];
+    $attributes = $span->getEvents()[0]->getAttributes();
+
+    expect($attributes->get('exception.stacktrace'))->toContain('SQL: select * from tokens where secret = ?')
+        ->and($attributes->get('exception.message'))->toContain('SQL: select * from users where email = ? and pin = ?');
+
+    foreach ([$attributes->get('exception.message'), $attributes->get('exception.stacktrace'), $span->getStatus()->getDescription()] as $value) {
+        expect($value)->not->toContain('jane@example.test')->not->toContain('4321')->not->toContain('s3cr3t-value');
+    }
+});
+
+it('redacts a QueryException thrown inside Tracer::span', function () {
+    [$tracer, $exporter] = exceptionTracer();
+
+    expect(fn () => $tracer->span('load users', fn () => throw failedQuery()))->toThrow(QueryException::class);
+
+    $span = exceptionSpansByName($tracer, $exporter)['load users'];
+    $attributes = $span->getEvents()[0]->getAttributes();
+
+    expect($span->getStatus()->getCode())->toBe(StatusCode::STATUS_ERROR)
+        ->and($attributes->get('exception.message'))->toContain('SQL: select * from users where email = ? and pin = ?');
+
+    foreach ([$attributes->get('exception.message'), $attributes->get('exception.stacktrace'), $span->getStatus()->getDescription()] as $value) {
+        expect($value)->not->toContain('jane@example.test')->not->toContain('4321');
+    }
+});
+
+it('keeps the bindings of a QueryException thrown inside Tracer::span when record_bindings is on', function () {
+    config()->set('apm.options.database.record_bindings', true);
+
+    [$tracer, $exporter] = exceptionTracer();
+
+    expect(fn () => $tracer->span('load users', fn () => throw failedQuery()))->toThrow(QueryException::class);
+
+    $span = exceptionSpansByName($tracer, $exporter)['load users'];
+
+    expect($span->getEvents()[0]->getAttributes()->get('exception.message'))->toContain('jane@example.test')
+        ->and($span->getStatus()->getDescription())->toContain('jane@example.test');
 });
 
 it('only sets the status when another instrumentation already recorded the exception', function () {

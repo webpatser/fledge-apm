@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Fledge\Apm;
 
+use Fledge\Apm\Instrumentation\Support\ExceptionRecorder;
 use OpenTelemetry\API\Trace\SpanInterface;
 use OpenTelemetry\API\Trace\StatusCode;
 use OpenTelemetry\Context\ScopeInterface;
@@ -48,12 +49,16 @@ final class ActiveSpan
     /**
      * Record the exception as a span event and mark the span as failed.
      *
+     * Goes through ExceptionRecorder like every instrumentation: QueryException
+     * bindings are redacted (unless `apm.options.database.record_bindings`),
+     * and an exception another span or path already recorded only sets the
+     * status here.
+     *
      * @param  iterable<non-empty-string, mixed>  $attributes
      */
     public function recordException(Throwable $exception, iterable $attributes = []): self
     {
-        $this->span->recordException($exception, $attributes);
-        $this->span->setStatus(StatusCode::STATUS_ERROR, $exception->getMessage());
+        ExceptionRecorder::record($this->span, $exception, $attributes);
 
         return $this;
     }
