@@ -166,7 +166,9 @@ final class HttpInstrumentation implements Instrumentation
         }
 
         $method = $request->getMethod();
-        $route = $request->route();
+        // Read the resolver directly: Request::route()'s PHPDoc promises a Route, but an
+        // unmatched request (404, middleware short-circuit) resolves to null at runtime.
+        $route = ($request->getRouteResolver())();
 
         if ($route instanceof Route) {
             $uri = '/'.ltrim($route->uri(), '/');
