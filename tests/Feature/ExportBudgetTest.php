@@ -94,6 +94,59 @@ function failingExporter(): InMemoryExporter
     };
 }
 
+/**
+ * An SDK exporter for a healthy intake with `$latency` seconds per chunk that
+ * reads the flush deadline instead of racing it. A chunk that starts with at
+ * least `$latency` left is accepted after a busy-wait of exactly `$latency`.
+ * A chunk that starts with less is the budget-capped request: it waits until
+ * the deadline reports expired and only then fails, so it always ends right
+ * at the deadline, however loaded the machine is.
+ */
+function latencyExporter(float $latency): SpanExporterInterface
+{
+    return new class($latency) implements SpanExporterInterface
+    {
+        /** @var list<float> budget left (seconds) when each chunk started */
+        public array $calls = [];
+
+        public function __construct(private readonly float $latency) {}
+
+        public function export(iterable $batch, ?CancellationInterface $cancellation = null): FutureInterface
+        {
+            assert($cancellation instanceof ExportDeadline);
+
+            $remaining = $cancellation->remainingSeconds();
+            $this->calls[] = $remaining;
+
+            if ($remaining < $this->latency) {
+                while (! $cancellation->expired()) {
+                    // spin until the deadline
+                }
+
+                return new CompletedFuture(false);
+            }
+
+            $until = hrtime(true) + (int) ($this->latency * 1_000_000_000);
+
+            while (hrtime(true) < $until) {
+                // spin: the intake's latency
+            }
+
+            return new CompletedFuture(true);
+        }
+
+        public function shutdown(?CancellationInterface $cancellation = null): bool
+        {
+            return true;
+        }
+
+        public function forceFlush(?CancellationInterface $cancellation = null): bool
+        {
+            return true;
+        }
+    };
+}
+
 it('keeps a flush against an intake that never accepts the connection within the budget', function () {
     $calls = [];
 
@@ -225,42 +278,32 @@ it('opens the breaker for every worker after a failure, skips exports while open
 it('does not open the breaker when the flush budget runs out after the intake accepted earlier chunks', function () {
     $store = new Repository(new ArrayStore);
     $breaker = new ExportCircuitBreaker(30, static fn (): Repository => $store, 'fledge-apm:breaker:budget');
-    $calls = [];
 
     // A healthy intake with moderate latency: each chunk takes 150 ms.
-    $healthyIntake = function (RequestInterface $request, array $options) use (&$calls): Response|ConnectException {
-        $calls[] = $options;
-        $timeout = (float) $options['timeout'];
+    $exporter = latencyExporter(0.15);
 
-        if ($timeout < 0.15) {
-            delay($timeout);
-
-            return new ConnectException("Operation timed out after {$timeout} s", $request);
-        }
-
-        delay(0.15);
-
-        return new Response(200);
-    };
-
-    $tracer = budgetTracer(array_fill(0, 20, $healthyIntake), budgetMs: 400, chunk: 1, breaker: $breaker);
+    $tracer = TracerFactory::make([
+        'enabled' => true,
+        'keep' => ['slow_ms' => 0],
+        'batch' => ['flush_budget_ms' => 400, 'max_export_batch_size' => 1],
+    ], new FiberContextStorage, $exporter, $breaker);
 
     foreach (range(1, 6) as $i) {
         $tracer->span("span {$i}", fn () => null);
     }
 
-    // Some chunks fit, the next times out on the budget (its request timeout
-    // capped below the intake's latency), the rest never start.
+    // Some chunks fit, the next times out on the budget (it started with
+    // less budget than the intake's latency), the rest never start.
     expect($tracer->flush())->toBeFalse()
-        ->and(count($calls))->toBeGreaterThanOrEqual(2)->toBeLessThan(6)
-        ->and((float) end($calls)['timeout'])->toBeLessThan(0.15)
+        ->and(count($exporter->calls))->toBeGreaterThanOrEqual(2)->toBeLessThan(6)
+        ->and(end($exporter->calls))->toBeLessThan(0.15)
         ->and($breaker->isOpen())->toBeFalse();
 
-    $before = count($calls);
+    $before = count($exporter->calls);
     $tracer->span('next request', fn () => null);
 
     expect($tracer->flush())->toBeTrue()
-        ->and($calls)->toHaveCount($before + 1);
+        ->and($exporter->calls)->toHaveCount($before + 1);
 });
 
 it('still opens the breaker when the first chunk of a flush outlasts the budget', function () {
@@ -396,22 +439,12 @@ it('opens the breaker after three consecutive flushes cut off by the budget, and
     $breaker = new ExportCircuitBreaker(30, static fn (): Repository => $store, 'fledge-apm:breaker:slow-alive');
 
     // Slow but alive: every chunk takes 150 ms, so with a 300 ms budget the
-    // second chunk of a flush is always cut off by its capped timeout.
-    $slowIntake = function (RequestInterface $request, array $options): Response|ConnectException {
-        $timeout = (float) $options['timeout'];
-
-        if ($timeout < 0.15) {
-            delay($timeout);
-
-            return new ConnectException("Operation timed out after {$timeout} s", $request);
-        }
-
-        delay(0.15);
-
-        return new Response(200);
-    };
-
-    $tracer = budgetTracer(array_fill(0, 30, $slowIntake), budgetMs: 300, chunk: 1, breaker: $breaker);
+    // second chunk of a flush is always cut off by the budget.
+    $tracer = TracerFactory::make([
+        'enabled' => true,
+        'keep' => ['slow_ms' => 0],
+        'batch' => ['flush_budget_ms' => 300, 'max_export_batch_size' => 1],
+    ], new FiberContextStorage, latencyExporter(0.15), $breaker);
 
     $cutOffFlush = function () use ($tracer): bool {
         foreach (range(1, 3) as $i) {
