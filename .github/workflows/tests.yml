@@ -45,11 +45,6 @@ jobs:
   phpstan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Does not gate merges yet: phpstan.neon (level 5) currently reports 5 errors
-    # in src/Instrumentation (a redundant instanceof and three always-true type
-    # checks, none of them real bugs). Remove continue-on-error once they are
-    # fixed or baselined.
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v5
