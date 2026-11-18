@@ -83,7 +83,7 @@ The space in the header value is encoded as `%20`. See `config/apm.php` for batc
 
 ## Production safety
 
-A tracer must never take your app down with it. Spans are buffered in process and exported after the response was sent (terminating callback, off the response path). Queue workers flush on an interval and once more when they stop.
+A tracer must never take your app down with it. Spans are buffered in process and exported after the response was sent (terminating callback, off the response path). Queue workers flush on an interval and once more when they stop. Under Octane, spans are exported once `APM_MAX_EXPORT_BATCH_SIZE` spans are buffered or `APM_WORKER_FLUSH_INTERVAL` seconds (default 5) have passed, checked when a request ends, and when the worker stops. Where a Revolt event loop runs (the Fledge server, torque workers), a background timer also exports an idle worker's spans every `APM_WORKER_FLUSH_INTERVAL` seconds. Under Swoole, RoadRunner and FrankenPHP no loop runs between requests, so an idle worker keeps its spans until its next request or until it stops. A worker killed without a clean stop (`kill -9`, a reload past its kill timeout) loses what was buffered since its last export: up to `APM_MAX_EXPORT_BATCH_SIZE` minus one spans plus the last request's spans, capped by `APM_MAX_QUEUE_SIZE`. A request that produced no spans (not sampled, or APM disabled) does not start a background flush.
 
 - **Flush budget:** `APM_FLUSH_BUDGET_MS` (default 1500) bounds one whole flush, including timeouts and retries. A slow or dead intake holds a PHP-FPM or queue worker for at most that long, and a flush stops at its first failed chunk.
 - **No retries on hot paths:** retries only happen on the final flush (queue `WorkerStopping`, shutdown). After an HTTP response or between jobs it is one attempt per chunk.
@@ -143,7 +143,7 @@ An incoming `traceparent` is ignored by default, so a public client cannot choos
 
 ## Known limits
 
-- A long-running Fledge server process that never terminates the app per request does not flush yet. It needs a Revolt repeat timer, which is not built.
+- Under Swoole, RoadRunner and FrankenPHP an idle worker keeps its buffered spans until its next request or until it stops; see Production safety.
 - Only Laravel's `Http` client is traced. Other clients (raw Guzzle, curl, SDKs with their own transport) are not.
 - While the circuit breaker is open, spans are dropped, not queued.
 - Raw `EventLoop::queue()` callbacks and Fledge's low-level server/IO loops do not carry trace context. Fibers started with `async()` do.

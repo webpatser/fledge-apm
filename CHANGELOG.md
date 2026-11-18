@@ -16,6 +16,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Under Octane, spans are exported once `max_export_batch_size` spans are buffered or `worker_flush_interval` has passed (checked when a request ends), and when the worker stops; before, a worker exported after every request. PHP-FPM, CLI and queue workers flush as before.
+- Where a Revolt event loop runs (the Fledge server, torque workers), a background timer also exports an idle worker's spans every `worker_flush_interval`. Under Swoole, RoadRunner and FrankenPHP no loop runs between requests, so an idle worker keeps its spans until its next request or until it stops.
+- A worker killed without a clean stop (`kill -9`, a reload past its kill timeout) loses everything buffered since the last export: up to `max_export_batch_size` minus one spans plus the last request's spans, capped by `max_queue_size`.
+- A request that produced no spans (not sampled, or APM disabled) no longer starts a background flush.
 - `ActiveSpan::recordException()` no longer adds a second `exception` event for an exception that was already recorded elsewhere; it only sets the error status.
 
 ### Fixed
