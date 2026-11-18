@@ -12,6 +12,7 @@ use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
+use OpenTelemetry\API\Trace\TraceFlags;
 use OpenTelemetry\SDK\Trace\SpanDataInterface;
 use OpenTelemetry\SDK\Trace\SpanExporter\InMemoryExporter;
 
@@ -43,6 +44,18 @@ function httpSpans(Tracer $tracer, InMemoryExporter $exporter): array
     ));
 }
 
+/**
+ * The traceparent of a request sent from $span: version 00, the trace id and
+ * span id of $span, and the sampled flag set. The other flag bits belong to the
+ * SDK: since open-telemetry/sdk 1.16 a root span also carries the W3C level 2
+ * random trace id flag, so the flags byte is 03 there and 01 on older SDKs.
+ */
+function expectChildTraceparent(?string $traceparent, SpanDataInterface $span): void
+{
+    expect($traceparent)->toMatch(sprintf('/^00-%s-%s-[0-9a-f]{2}$/', $span->getTraceId(), $span->getSpanId()))
+        ->and(hexdec(substr((string) $traceparent, -2)) & TraceFlags::SAMPLED)->toBe(TraceFlags::SAMPLED);
+}
+
 it('records a CLIENT span and injects the span traceparent into the request', function () {
     [$tracer, $exporter] = httpTracer();
     $seen = null;
@@ -68,9 +81,10 @@ it('records a CLIENT span and injects the span traceparent into the request', fu
         ->and($attributes->get('server.address'))->toBe('api.example.test')
         ->and($attributes->get('server.port'))->toBe(443)
         ->and($attributes->get('http.response.status_code'))->toBe(200)
-        ->and($span->getStatus()->getCode())->not->toBe(StatusCode::STATUS_ERROR)
-        // The downstream service joins the trace as a child of the client span.
-        ->and($seen)->toBe(sprintf('00-%s-%s-01', $span->getTraceId(), $span->getSpanId()));
+        ->and($span->getStatus()->getCode())->not->toBe(StatusCode::STATUS_ERROR);
+
+    // The downstream service joins the trace as a child of the client span.
+    expectChildTraceparent($seen, $span);
 });
 
 it('marks 5xx responses as errors', function (int $status) {
@@ -317,7 +331,8 @@ it('gives requests sent from parallel fibers their own span under their own pare
     foreach ([1, 2] as $card) {
         $span = $spans["https://api.example.test/card/{$card}"];
 
-        expect($span->getParentSpanId())->toBe($cards[$card])
-            ->and($seen["https://api.example.test/card/{$card}"])->toBe(sprintf('00-%s-%s-01', $span->getTraceId(), $span->getSpanId()));
+        expect($span->getParentSpanId())->toBe($cards[$card]);
+
+        expectChildTraceparent($seen["https://api.example.test/card/{$card}"], $span);
     }
 });
