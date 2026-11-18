@@ -3,13 +3,21 @@
 declare(strict_types=1);
 
 use Fledge\Apm\ApmServiceProvider;
+use Fledge\Apm\Context\FiberContextStorage;
 use Fledge\Apm\Export\ThrottledLogWriter;
 use Fledge\Apm\Tracer;
+use Fledge\Apm\TracerFactory;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Log;
+use Laravel\Octane\Events\RequestReceived;
 use OpenTelemetry\API\Behavior\Internal\Logging;
+use OpenTelemetry\SDK\Trace\SpanExporter\InMemoryExporter;
+use Revolt\EventLoop;
+use Revolt\EventLoop\CallbackType;
+
+use function Fledge\Async\delay;
 
 it('is a no-op with zero listeners when disabled', function () {
     $tracer = app(Tracer::class);
@@ -68,6 +76,178 @@ it('clears scopes leaked on the main context before the next job', function () {
 
     expect($result)->not->toBeFalse()
         ->and($tracer->storage()->depth())->toBe(0);
+});
+
+/**
+ * Boot a fresh enabled provider whose Tracer exports to `$exporter`, which
+ * counts its export calls.
+ *
+ * @param  array<string, int>  $batch
+ */
+function bootCountingApm(InMemoryExporter $exporter, array $batch = []): Tracer
+{
+    config()->set('apm.enabled', true);
+    config()->set('apm.breaker.enabled', false);
+    config()->set('apm.keep.slow_ms', 0);
+    config()->set('apm.batch', [...config('apm.batch'), ...$batch]);
+    config()->set('apm.instrumentation', array_fill_keys(array_keys(ApmServiceProvider::INSTRUMENTATIONS), false));
+
+    $provider = new ApmServiceProvider(app());
+    $provider->register();
+
+    $tracer = TracerFactory::make(config('apm'), app(FiberContextStorage::class), $exporter);
+    app()->instance(Tracer::class, $tracer);
+
+    $provider->boot();
+
+    return $tracer;
+}
+
+function countingExporter(): InMemoryExporter
+{
+    return new class extends InMemoryExporter
+    {
+        public int $exports = 0;
+
+        protected function doExport(iterable $spans): bool
+        {
+            $this->exports++;
+
+            return parent::doExport($spans);
+        }
+    };
+}
+
+/**
+ * One request: a span, then the app's terminating callbacks.
+ */
+function simulateRequest(Tracer $tracer, string $name = 'request'): void
+{
+    $tracer->span($name, fn () => null);
+    app()->terminate();
+}
+
+it('counts the spans waiting for export', function () {
+    $tracer = bootCountingApm(countingExporter());
+
+    expect($tracer->bufferedSpans())->toBe(0);
+
+    $tracer->span('one', fn () => null);
+    $tracer->span('two', fn () => null);
+
+    expect($tracer->bufferedSpans())->toBe(2);
+
+    $tracer->flush();
+
+    expect($tracer->bufferedSpans())->toBe(0)
+        ->and(Tracer::disabled()->bufferedSpans())->toBe(0);
+});
+
+it('exports after every request outside Octane', function () {
+    $exporter = countingExporter();
+    $tracer = bootCountingApm($exporter);
+
+    simulateRequest($tracer);
+    simulateRequest($tracer);
+    simulateRequest($tracer);
+
+    expect($exporter->exports)->toBe(3)
+        ->and($exporter->getSpans())->toHaveCount(3)
+        ->and($tracer->bufferedSpans())->toBe(0);
+});
+
+it('exports on a full batch instead of after every request under Octane', function () {
+    require_once __DIR__.'/../Fixtures/Octane/Events.php';
+
+    $exporter = countingExporter();
+    $tracer = bootCountingApm($exporter, ['max_export_batch_size' => 4, 'worker_flush_interval' => 3600]);
+
+    foreach (range(1, 3) as $request) {
+        event(new RequestReceived);
+        simulateRequest($tracer, "request {$request}");
+    }
+
+    expect($exporter->exports)->toBe(0)
+        ->and($tracer->bufferedSpans())->toBe(3);
+
+    event(new RequestReceived);
+    simulateRequest($tracer, 'request 4');
+
+    expect($exporter->exports)->toBe(1)
+        ->and(array_map(fn ($span) => $span->getName(), $exporter->getSpans()))
+        ->toBe(['request 1', 'request 2', 'request 3', 'request 4'])
+        ->and($tracer->bufferedSpans())->toBe(0);
+});
+
+it('exports what is left when the Octane worker stops', function () {
+    require_once __DIR__.'/../Fixtures/Octane/Events.php';
+
+    $exporter = countingExporter();
+    $tracer = bootCountingApm($exporter, ['worker_flush_interval' => 3600]);
+
+    event(new RequestReceived);
+    simulateRequest($tracer);
+    event(new RequestReceived);
+    simulateRequest($tracer);
+
+    expect($exporter->exports)->toBe(0);
+
+    event(new Laravel\Octane\Events\WorkerStopping);
+
+    expect($exporter->exports)->toBe(1)
+        ->and($exporter->getSpans())->toHaveCount(2)
+        ->and($tracer->bufferedSpans())->toBe(0);
+});
+
+/**
+ * Unreferenced repeat timers on the event loop.
+ *
+ * @return list<string>
+ */
+function unreferencedRepeatTimers(): array
+{
+    return array_values(array_filter(
+        EventLoop::getIdentifiers(),
+        fn (string $id): bool => EventLoop::getType($id) === CallbackType::Repeat
+            && EventLoop::isEnabled($id)
+            && ! EventLoop::isReferenced($id),
+    ));
+}
+
+it('flushes an idle worker on an unreferenced timer when an event loop runs', function () {
+    require_once __DIR__.'/../Fixtures/Octane/Events.php';
+
+    delay(0); // the event loop now runs, as in the Fledge server and torque workers
+
+    expect(EventLoop::getDriver()->isRunning())->toBeTrue();
+
+    $before = unreferencedRepeatTimers();
+    $exporter = countingExporter();
+    $tracer = bootCountingApm($exporter, ['worker_flush_interval' => 1]);
+
+    event(new RequestReceived);
+    simulateRequest($tracer);
+    event(new RequestReceived);
+    simulateRequest($tracer);
+
+    $timers = array_values(array_diff(unreferencedRepeatTimers(), $before));
+
+    expect($exporter->exports)->toBe(0)
+        ->and($tracer->bufferedSpans())->toBe(2)
+        ->and($timers)->toHaveCount(1);
+
+    delay(1.2); // idle: no request ends, only the timer can flush
+
+    expect($exporter->exports)->toBe(1)
+        ->and($exporter->getSpans())->toHaveCount(2)
+        ->and($tracer->bufferedSpans())->toBe(0);
+
+    delay(1.2); // nothing buffered: the timer does nothing
+
+    expect($exporter->exports)->toBe(1)
+        ->and(array_values(array_diff(unreferencedRepeatTimers(), $before)))->toBe($timers);
+
+    EventLoop::cancel($timers[0]);
 });
 
 it('routes SDK log lines through the throttled Laravel log writer', function () {

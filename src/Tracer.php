@@ -7,6 +7,7 @@ namespace Fledge\Apm;
 use Closure;
 use Fledge\Apm\Context\FiberContextStorage;
 use Fledge\Apm\Export\ExportDeadline;
+use Fledge\Apm\Export\FiberBatchSpanProcessor;
 use OpenTelemetry\API\Common\Time\Clock;
 use OpenTelemetry\API\Trace\LocalRootSpan;
 use OpenTelemetry\API\Trace\NoopTracer;
@@ -43,6 +44,7 @@ final class Tracer
         private readonly FiberContextStorage $storage,
         private readonly ?TracerProviderInterface $provider = null,
         private readonly int $flushBudgetMs = 1500,
+        private readonly ?FiberBatchSpanProcessor $processor = null,
     ) {}
 
     public static function disabled(): self
@@ -232,7 +234,9 @@ final class Tracer
      */
     public function flushInBackground(bool $await = true, bool $retry = false): void
     {
-        if ($this->provider === null) {
+        // Nothing buffered (an unsampled request, a request without spans):
+        // the flush would find an empty batch, so skip the fiber.
+        if ($this->provider === null || $this->bufferedSpans() === 0) {
             return;
         }
 
@@ -251,6 +255,19 @@ final class Tracer
         } else {
             $future->ignore();
         }
+    }
+
+    /**
+     * Spans ready for export, or null when the span processor is not the
+     * package's own (a provider passed in by hand) and cannot tell.
+     */
+    public function bufferedSpans(): ?int
+    {
+        if ($this->provider === null) {
+            return 0;
+        }
+
+        return $this->processor?->stats()['ready'];
     }
 
     public function shutdown(): bool

@@ -89,7 +89,9 @@ return [
     |--------------------------------------------------------------------------
     |
     | Spans are buffered in process and exported after the response was sent
-    | (HTTP) or every worker_flush_interval seconds (queue workers).
+    | (PHP-FPM, artisan) or every worker_flush_interval seconds (queue and
+    | Octane workers; Octane also exports once max_export_batch_size spans
+    | are buffered, and when the worker stops).
     |
     | flush_budget_ms bounds one whole flush (all chunks, timeouts and
     | retries), so a slow or down intake holds a PHP-FPM or queue worker for

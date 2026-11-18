@@ -24,6 +24,7 @@ use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Support\ServiceProvider;
 use OpenTelemetry\API\Behavior\Internal\Logging;
 use Psr\Log\LoggerInterface;
+use Revolt\EventLoop;
 use Throwable;
 
 final class ApmServiceProvider extends ServiceProvider
@@ -48,8 +49,19 @@ final class ApmServiceProvider extends ServiceProvider
     /** Octane's per-request end event; Octane is optional. */
     private const string OCTANE_REQUEST_TERMINATED = 'Laravel\\Octane\\Events\\RequestTerminated';
 
+    /** Octane's per-request start event, before the app handles the request. */
+    private const string OCTANE_REQUEST_RECEIVED = 'Laravel\\Octane\\Events\\RequestReceived';
+
+    /** Octane's worker shutdown event (Swoole, RoadRunner and FrankenPHP). */
+    private const string OCTANE_WORKER_STOPPING = 'Laravel\\Octane\\Events\\WorkerStopping';
+
     /** The missing-propagation warning is logged once per process. */
     private static bool $warnedPropagation = false;
+
+    /** The one idle flush timer of this process, and the Tracer it flushes. */
+    private static ?string $idleFlushTimer = null;
+
+    private static ?Tracer $idleFlushTracer = null;
 
     public function register(): void
     {
@@ -167,17 +179,71 @@ final class ApmServiceProvider extends ServiceProvider
      * attempt per chunk within the flush budget, so a down intake never
      * keeps a worker from serving.
      *
-     * Not covered yet: a long-running Fledge server process that never
-     * terminates the app per request would need a Revolt repeat timer.
+     * Under Octane the terminating callbacks run in the worker before it
+     * takes the next request, so an export there holds the worker. Once an
+     * Octane request was seen, the terminating flush only runs when a full
+     * export batch is buffered or worker_flush_interval has passed, and
+     * Octane's WorkerStopping flushes the rest.
+     *
+     * When a Revolt event loop runs in the process (the Fledge server, torque
+     * workers), one unreferenced repeat timer also flushes in the background
+     * every worker_flush_interval while spans are buffered, so an idle worker
+     * does not hold them. Under Swoole, RoadRunner and FrankenPHP no loop
+     * runs between requests: an idle Octane worker holds its spans until its
+     * next request or WorkerStopping.
+     *
+     * A worker that dies without WorkerStopping (kill -9, a reload past its
+     * kill timeout) loses everything buffered since the last flush: up to a
+     * batch minus one plus the last request's spans, capped by
+     * max_queue_size.
      */
     private function registerFlushing(Tracer $tracer): void
     {
-        $this->app->terminating(static fn () => $tracer->flushInBackground());
+        $config = $this->app['config'];
+        $interval = max(1, (int) $config->get('apm.batch.worker_flush_interval', 5));
+        $batchSize = max(1, (int) $config->get('apm.batch.max_export_batch_size', 128));
+        $intervalNanos = $interval * 1_000_000_000;
+        $terminating = new class
+        {
+            public bool $octane = false;
 
-        $interval = max(1, (int) $this->app['config']->get('apm.batch.worker_flush_interval', 5));
+            public int $lastFlush = 0;
+        };
+        $terminating->lastFlush = hrtime(true);
+
+        self::registerIdleFlushTimer($tracer, $interval);
+
+        $this->app->terminating(static function () use ($tracer, $interval, $batchSize, $intervalNanos, $terminating): void {
+            // The loop may start after boot (first awaited I/O of a request).
+            self::registerIdleFlushTimer($tracer, $interval);
+
+            if (
+                $terminating->octane
+                && ($tracer->bufferedSpans() ?? $batchSize) < $batchSize
+                && hrtime(true) - $terminating->lastFlush < $intervalNanos
+            ) {
+                return;
+            }
+
+            $terminating->lastFlush = hrtime(true);
+            $tracer->flushInBackground();
+        });
+
         $lastFlush = hrtime(true);
 
         $events = $this->app->make(Dispatcher::class);
+
+        if (class_exists(self::OCTANE_REQUEST_RECEIVED)) {
+            $events->listen(self::OCTANE_REQUEST_RECEIVED, static function () use ($terminating): void {
+                $terminating->octane = true;
+            });
+        }
+
+        if (class_exists(self::OCTANE_WORKER_STOPPING)) {
+            $events->listen(self::OCTANE_WORKER_STOPPING, static function () use ($tracer): void {
+                $tracer->flushInBackground(retry: true);
+            });
+        }
 
         $events->listen(Looping::class, static function () use ($tracer, $interval, &$lastFlush): void {
             if (hrtime(true) - $lastFlush < $interval * 1_000_000_000) {
@@ -191,6 +257,31 @@ final class ApmServiceProvider extends ServiceProvider
         $events->listen(WorkerStopping::class, static function () use ($tracer): void {
             $tracer->flushInBackground(retry: true);
         });
+    }
+
+    /**
+     * One unreferenced repeat timer per process, only while a Revolt event
+     * loop runs; never starts a loop and never keeps one alive. Each tick
+     * costs one count when nothing is buffered, and otherwise starts a
+     * background flush that nothing waits for. A provider booted again for
+     * a new Tracer (tests) replaces the timer.
+     */
+    private static function registerIdleFlushTimer(Tracer $tracer, int $interval): void
+    {
+        if (self::$idleFlushTracer === $tracer || ! EventLoop::getDriver()->isRunning()) {
+            return;
+        }
+
+        if (self::$idleFlushTimer !== null) {
+            EventLoop::cancel(self::$idleFlushTimer);
+        }
+
+        self::$idleFlushTracer = $tracer;
+        self::$idleFlushTimer = EventLoop::unreference(EventLoop::repeat((float) $interval, static function () use ($tracer): void {
+            if (($tracer->bufferedSpans() ?? 1) > 0) {
+                $tracer->flushInBackground(await: false);
+            }
+        }));
     }
 
     /**

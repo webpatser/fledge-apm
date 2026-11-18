@@ -84,6 +84,7 @@ final class TracerFactory
             $storage,
             $provider,
             $budget,
+            $processor,
         );
     }
 
