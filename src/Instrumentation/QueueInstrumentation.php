@@ -86,11 +86,15 @@ final class QueueInstrumentation implements Instrumentation
         $payload = $this->payload($job);
         $name = $this->displayName($job, $payload);
 
+        // The contract says string, but RedisJob returns null for a payload without an id.
+        /** @var string|int|null $jobId */
+        $jobId = $job->getJobId();
+
         $attributes = array_filter([
             'messaging.system' => 'laravel-queue',
             'messaging.operation.type' => 'process',
             'messaging.destination.name' => $job->getQueue(),
-            'messaging.message.id' => $job->getJobId(),
+            'messaging.message.id' => $jobId,
             'laravel.queue.connection' => $event->connectionName,
             'laravel.job.name' => $job->resolveName(),
             'laravel.job.attempts' => $job->attempts(),
@@ -168,6 +172,8 @@ final class QueueInstrumentation implements Instrumentation
     private function payload(Job $job): array
     {
         try {
+            // The contract says array, but payload() is an unchecked json_decode() of the raw body.
+            /** @var mixed $payload */
             $payload = $job->payload();
         } catch (Throwable) {
             return [];
@@ -185,6 +191,8 @@ final class QueueInstrumentation implements Instrumentation
         $name = $payload['displayName'] ?? null;
 
         if (! is_string($name) || $name === '') {
+            // The contract says string, but it is the payload's unchecked `job` key.
+            /** @var mixed $name */
             $name = $job->resolveName();
         }
 

@@ -9,6 +9,7 @@ use Fledge\Apm\ActiveSpan;
 use Fledge\Apm\Instrumentation\Support\ExceptionRecorder;
 use Fledge\Apm\Instrumentation\Support\UrlRedaction;
 use Fledge\Apm\Tracer;
+use Illuminate\Contracts\Auth\Guard;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Http\Kernel as HttpKernel;
 use Illuminate\Foundation\Events\Terminating;
@@ -234,7 +235,7 @@ final class HttpInstrumentation implements Instrumentation
         try {
             $guard = $this->app->make('auth')->guard();
 
-            if (! method_exists($guard, 'hasUser') || ! $guard->hasUser()) {
+            if (! $guard instanceof Guard || ! $guard->hasUser()) {
                 return null;
             }
 
