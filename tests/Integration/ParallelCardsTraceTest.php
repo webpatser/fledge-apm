@@ -356,6 +356,8 @@ it('nests every Livewire card of a FiberHandleRequests batch under the update sp
     // FiberHandleRequests must be bound before Livewire boots its mechanisms.
     app()->register(FiberLivewireServiceProvider::class);
     app()->register(LivewireServiceProvider::class);
+    // Concurrent rendering is opt-in on purpose: it is off by default since fledge-fiber 13.42.0.2.
+    config()->set('fledge-livewire.concurrent', true);
     app('livewire')->component('apm-card', ApmCard::class);
 
     expect(app(HandleRequests::class))->toBeInstanceOf(FiberHandleRequests::class);
