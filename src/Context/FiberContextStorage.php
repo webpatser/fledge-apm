@@ -5,12 +5,12 @@ declare(strict_types=1);
 namespace Fledge\Apm\Context;
 
 use Fiber;
+use Fledge\Loop\FiberLocal;
 use OpenTelemetry\Context\Context;
 use OpenTelemetry\Context\ContextInterface;
 use OpenTelemetry\Context\ContextStorageInterface;
 use OpenTelemetry\Context\ContextStorageScopeInterface;
 use OpenTelemetry\Context\ExecutionContextAwareInterface;
-use Fledge\Loop\FiberLocal;
 
 /**
  * OpenTelemetry context storage with one scope stack per fiber, safe under

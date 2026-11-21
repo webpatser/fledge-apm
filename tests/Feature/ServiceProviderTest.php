@@ -7,6 +7,8 @@ use Fledge\Apm\Context\FiberContextStorage;
 use Fledge\Apm\Export\ThrottledLogWriter;
 use Fledge\Apm\Tracer;
 use Fledge\Apm\TracerFactory;
+use Fledge\Loop;
+use Fledge\Loop\CallbackType;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Support\Facades\Event;
@@ -14,8 +16,6 @@ use Illuminate\Support\Facades\Log;
 use Laravel\Octane\Events\RequestReceived;
 use OpenTelemetry\API\Behavior\Internal\Logging;
 use OpenTelemetry\SDK\Trace\SpanExporter\InMemoryExporter;
-use Fledge\Loop;
-use Fledge\Loop\CallbackType;
 
 use function Fledge\Async\delay;
 

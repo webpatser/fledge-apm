@@ -17,6 +17,7 @@ use Fledge\Apm\Instrumentation\HttpInstrumentation;
 use Fledge\Apm\Instrumentation\Instrumentation;
 use Fledge\Apm\Instrumentation\LivewireInstrumentation;
 use Fledge\Apm\Instrumentation\QueueInstrumentation;
+use Fledge\Loop;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\Looping;
@@ -24,7 +25,6 @@ use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Support\ServiceProvider;
 use OpenTelemetry\API\Behavior\Internal\Logging;
 use Psr\Log\LoggerInterface;
-use Fledge\Loop;
 use Throwable;
 
 final class ApmServiceProvider extends ServiceProvider
