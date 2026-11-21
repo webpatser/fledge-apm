@@ -24,7 +24,7 @@ use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Support\ServiceProvider;
 use OpenTelemetry\API\Behavior\Internal\Logging;
 use Psr\Log\LoggerInterface;
-use Revolt\EventLoop;
+use Fledge\Loop;
 use Throwable;
 
 final class ApmServiceProvider extends ServiceProvider
@@ -185,7 +185,7 @@ final class ApmServiceProvider extends ServiceProvider
      * export batch is buffered or worker_flush_interval has passed, and
      * Octane's WorkerStopping flushes the rest.
      *
-     * When a Revolt event loop runs in the process (the Fledge server, torque
+     * When the Fledge event loop runs in the process (the Fledge server, torque
      * workers), one unreferenced repeat timer also flushes in the background
      * every worker_flush_interval while spans are buffered, so an idle worker
      * does not hold them. Under Swoole, RoadRunner and FrankenPHP no loop
@@ -260,7 +260,7 @@ final class ApmServiceProvider extends ServiceProvider
     }
 
     /**
-     * One unreferenced repeat timer per process, only while a Revolt event
+     * One unreferenced repeat timer per process, only while the Fledge event
      * loop runs; never starts a loop and never keeps one alive. Each tick
      * costs one count when nothing is buffered, and otherwise starts a
      * background flush that nothing waits for. A provider booted again for
@@ -268,16 +268,16 @@ final class ApmServiceProvider extends ServiceProvider
      */
     private static function registerIdleFlushTimer(Tracer $tracer, int $interval): void
     {
-        if (self::$idleFlushTracer === $tracer || ! EventLoop::getDriver()->isRunning()) {
+        if (self::$idleFlushTracer === $tracer || ! Loop::getDriver()->isRunning()) {
             return;
         }
 
         if (self::$idleFlushTimer !== null) {
-            EventLoop::cancel(self::$idleFlushTimer);
+            Loop::cancel(self::$idleFlushTimer);
         }
 
         self::$idleFlushTracer = $tracer;
-        self::$idleFlushTimer = EventLoop::unreference(EventLoop::repeat((float) $interval, static function () use ($tracer): void {
+        self::$idleFlushTimer = Loop::unreference(Loop::repeat((float) $interval, static function () use ($tracer): void {
             if (($tracer->bufferedSpans() ?? 1) > 0) {
                 $tracer->flushInBackground(await: false);
             }

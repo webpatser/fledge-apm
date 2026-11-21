@@ -67,7 +67,7 @@ final class FiberContextScope implements ContextStorageScopeInterface
         }
 
         // A scope missing from its stack was dropped by FiberContextStorage::release()
-        // or by Revolt clearing the fiber-local stack of a reused fiber.
+        // or by the event loop clearing the fiber-local stack of a reused fiber.
         $this->markDetached();
 
         return $node === null ? ($flags | ScopeInterface::DETACHED) : ($flags | ScopeInterface::MISMATCH | $depth);

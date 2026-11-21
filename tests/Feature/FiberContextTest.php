@@ -97,7 +97,7 @@ it('gives five parallel async fibers sibling spans under one parent without cont
         ->and($spans['GET /pulse']->getParentContext()->isValid())->toBeFalse();
 });
 
-it('starts a reused Revolt callback fiber with an empty stack after a callback leaked a scope', function () {
+it('starts a reused loop callback fiber with an empty stack after a callback leaked a scope', function () {
     [$tracer, , $storage] = memoryTracer();
     $fibers = [];
 

@@ -130,7 +130,7 @@ final class Tracer
 
         // Attach through the storage, not Context::activate(), so the
         // assertion-only DebugScope wrapper never warns about scopes that a
-        // reused Revolt fiber had cleared.
+        // reused loop fiber had cleared.
         return new ActiveSpan($span, $this->storage->attach($context));
     }
 

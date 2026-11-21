@@ -10,22 +10,22 @@ use OpenTelemetry\Context\ContextInterface;
 use OpenTelemetry\Context\ContextStorageInterface;
 use OpenTelemetry\Context\ContextStorageScopeInterface;
 use OpenTelemetry\Context\ExecutionContextAwareInterface;
-use Revolt\EventLoop\FiberLocal;
+use Fledge\Loop\FiberLocal;
 
 /**
  * OpenTelemetry context storage with one scope stack per fiber, safe under
- * Revolt's fiber reuse and parallel Fledge\Async\async() fibers.
+ * the event loop's fiber reuse and parallel Fledge\Async\async() fibers.
  *
  * Why not the SDK's FiberBoundContextStorage:
- * - It keys heads on the Fiber object for the fiber's whole lifetime. Revolt
- *   reuses one callback fiber for every queued callback that completes
+ * - It keys heads on the Fiber object for the fiber's whole lifetime. The event
+ *   loop reuses one callback fiber for every queued callback that completes
  *   without suspending, so a scope a callback leaks (never detached) bleeds
  *   into the next, unrelated callback on that fiber.
  * - A fresh fiber starts with no head: current() triggers E_USER_WARNING
  *   (which Laravel turns into an ErrorException) and falls back to {main},
  *   not to the fiber that spawned it.
  *
- * This storage keys stacks with Revolt's FiberLocal, which the event loop
+ * This storage keys stacks with Fledge\Loop\FiberLocal, which the event loop
  * clears after every callback and microtask (the unit async() runs in). A
  * reused callback fiber therefore always starts with an empty stack, the
  * same guarantee UsesNativePdoPool gets from fiber plus scope-depth keying.
@@ -98,7 +98,7 @@ final class FiberContextStorage implements ContextStorageInterface, ExecutionCon
     /**
      * Drop the restored base scope and everything still attached above it
      * (scopes the child leaked), restoring the stack as it was before
-     * restore(). Safe to call after Revolt already cleared the stack.
+     * restore(). Safe to call after the event loop already cleared the stack.
      */
     public function release(FiberContextScope $base): void
     {
@@ -140,7 +140,7 @@ final class FiberContextStorage implements ContextStorageInterface, ExecutionCon
      * and would otherwise parent the next one.
      *
      * Called between units of work (queue Looping, Octane RequestTerminated).
-     * Fiber stacks are left alone; Revolt clears those itself. A span whose
+     * Fiber stacks are left alone; the event loop clears those itself. A span whose
      * scope was cleared still ends and exports normally: ActiveSpan::end()
      * then finds its scope already detached and leaves the stack untouched.
      *

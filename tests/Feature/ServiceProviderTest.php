@@ -14,8 +14,8 @@ use Illuminate\Support\Facades\Log;
 use Laravel\Octane\Events\RequestReceived;
 use OpenTelemetry\API\Behavior\Internal\Logging;
 use OpenTelemetry\SDK\Trace\SpanExporter\InMemoryExporter;
-use Revolt\EventLoop;
-use Revolt\EventLoop\CallbackType;
+use Fledge\Loop;
+use Fledge\Loop\CallbackType;
 
 use function Fledge\Async\delay;
 
@@ -207,10 +207,10 @@ it('exports what is left when the Octane worker stops', function () {
 function unreferencedRepeatTimers(): array
 {
     return array_values(array_filter(
-        EventLoop::getIdentifiers(),
-        fn (string $id): bool => EventLoop::getType($id) === CallbackType::Repeat
-            && EventLoop::isEnabled($id)
-            && ! EventLoop::isReferenced($id),
+        Loop::getIdentifiers(),
+        fn (string $id): bool => Loop::getType($id) === CallbackType::Repeat
+            && Loop::isEnabled($id)
+            && ! Loop::isReferenced($id),
     ));
 }
 
@@ -219,7 +219,7 @@ it('flushes an idle worker on an unreferenced timer when an event loop runs', fu
 
     delay(0); // the event loop now runs, as in the Fledge server and torque workers
 
-    expect(EventLoop::getDriver()->isRunning())->toBeTrue();
+    expect(Loop::getDriver()->isRunning())->toBeTrue();
 
     $before = unreferencedRepeatTimers();
     $exporter = countingExporter();
@@ -247,7 +247,7 @@ it('flushes an idle worker on an unreferenced timer when an event loop runs', fu
     expect($exporter->exports)->toBe(1)
         ->and(array_values(array_diff(unreferencedRepeatTimers(), $before)))->toBe($timers);
 
-    EventLoop::cancel($timers[0]);
+    Loop::cancel($timers[0]);
 });
 
 it('routes SDK log lines through the throttled Laravel log writer', function () {

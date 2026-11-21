@@ -8,9 +8,13 @@ It is independent of Laravel Pulse. Pulse stays your at-a-glance dashboard; this
 
 ## Requirements
 
-- PHP 8.5
-- `webpatser/fledge-framework` ^13.34
-- `webpatser/fledge-fiber` ^13.36.0.2 (required: provides `Fledge\Async\FiberContext`, which lets parallel fibers join the current trace). Without the hook the package logs a warning (at most once an hour).
+- PHP 8.6
+- `webpatser/fledge-framework` ^13.43.0.3
+- `webpatser/fledge-fiber` ^13.43.0.3 (required: provides `Fledge\Async\FiberContext`, which lets parallel fibers join the current trace). Without the hook the package logs a warning (at most once an hour).
+
+### PHP version policy
+
+This package supports only the latest stable PHP release. When a new PHP version is released, the next release of this package requires it and support for the previous PHP version ends. Currently: PHP 8.6.
 
 ## Install
 
@@ -83,7 +87,7 @@ The space in the header value is encoded as `%20`. See `config/apm.php` for batc
 
 ## Production safety
 
-A tracer must never take your app down with it. Spans are buffered in process and exported after the response was sent (terminating callback, off the response path). Queue workers flush on an interval and once more when they stop. Under Octane, spans are exported once `APM_MAX_EXPORT_BATCH_SIZE` spans are buffered or `APM_WORKER_FLUSH_INTERVAL` seconds (default 5) have passed, checked when a request ends, and when the worker stops. Where a Revolt event loop runs (the Fledge server, torque workers), a background timer also exports an idle worker's spans every `APM_WORKER_FLUSH_INTERVAL` seconds. Under Swoole, RoadRunner and FrankenPHP no loop runs between requests, so an idle worker keeps its spans until its next request or until it stops. A worker killed without a clean stop (`kill -9`, a reload past its kill timeout) loses what was buffered since its last export: up to `APM_MAX_EXPORT_BATCH_SIZE` minus one spans plus the last request's spans, capped by `APM_MAX_QUEUE_SIZE`. A request that produced no spans (not sampled, or APM disabled) does not start a background flush.
+A tracer must never take your app down with it. Spans are buffered in process and exported after the response was sent (terminating callback, off the response path). Queue workers flush on an interval and once more when they stop. Under Octane, spans are exported once `APM_MAX_EXPORT_BATCH_SIZE` spans are buffered or `APM_WORKER_FLUSH_INTERVAL` seconds (default 5) have passed, checked when a request ends, and when the worker stops. Where the Fledge event loop runs (the Fledge server, torque workers), a background timer also exports an idle worker's spans every `APM_WORKER_FLUSH_INTERVAL` seconds. Under Swoole, RoadRunner and FrankenPHP no loop runs between requests, so an idle worker keeps its spans until its next request or until it stops. A worker killed without a clean stop (`kill -9`, a reload past its kill timeout) loses what was buffered since its last export: up to `APM_MAX_EXPORT_BATCH_SIZE` minus one spans plus the last request's spans, capped by `APM_MAX_QUEUE_SIZE`. A request that produced no spans (not sampled, or APM disabled) does not start a background flush.
 
 - **Flush budget:** `APM_FLUSH_BUDGET_MS` (default 1500) bounds one whole flush, including timeouts and retries. A slow or dead intake holds a PHP-FPM or queue worker for at most that long, and a flush stops at its first failed chunk.
 - **No retries on hot paths:** retries only happen on the final flush (queue `WorkerStopping`, shutdown). After an HTTP response or between jobs it is one attempt per chunk.
@@ -165,6 +169,10 @@ composer test      # Pest
 composer lint      # Pint
 composer analyse   # PHPStan
 ```
+
+## Origins
+
+Fledge's async layer started as a port of [amphp](https://amphp.org) and its event loop as a port of [Revolt](https://revolt.run), both MIT licensed. Those projects showed how far fibers can take PHP, and Fledge builds on that work. Fledge has since gone its own way: PHP 8.6 only, shaped around Laravel, and maintained independently, so it does not track either project.
 
 ## License
 
