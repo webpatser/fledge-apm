@@ -2,6 +2,17 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-24
+
+### Added
+
+- HTTP client spans gain `network.peer.address`, `network.peer.port`, `network.protocol.version`, `http.response.body.size`, `fledge.http.connect_ms`, `fledge.http.tls_ms`, `fledge.http.ttfb_ms` and `fledge.http.connection_reused`. Toggle with `apm.options.http_client.timings` (default `true`). Connection reuse and ALPN need a fledge-fiber release that reports them; without ALPN the protocol version comes from the response. `fledge.http.connect_ms` and `fledge.http.tls_ms` are omitted on a fledge-fiber release that does not report `connection_reused` (a reused connection there repeats its original connect and TLS time), and on a failed connection.
+- Queue dispatches inside a trace get a PRODUCER span `send {queue}` that parents the consumer span; toggle it with `apm.options.queue.producer_spans` (default `true`). Consumer spans get `fledge.queue.wait_ms` on the first attempt, whatever that option says. A `later()` delay is included in the wait time, and a `queue:retry` resets attempts, so the retried job's wait time counts from the original dispatch. Producer spans that never see `JobQueued` (database `bulk()`, bus batches on the database driver, or a push that threw) are ended at a later sweep (Looping or the terminating callback, at most 60 s for spans of a fiber still running) without error status and carry `fledge.queue.unconfirmed`; their duration is not the push time.
+
+### Changed
+
+- `torque:start`, `torque:monitor`, `torque:tail` and `resonate:start` are ignored by default for console transactions.
+
 ## [0.3.0] - 2026-11-23
 
 ### Changed

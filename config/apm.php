@@ -222,6 +222,15 @@ return [
             // in the path (Telegram bots, Slack and Discord webhooks, long
             // random segments) are replaced by REDACTED.
             'record_full_path' => false,
+            // Add connect, TLS and time-to-first-byte timings, peer address,
+            // protocol version and response body size to client spans.
+            'timings' => true,
+        ],
+        'queue' => [
+            // Record a PRODUCER span per dispatch inside a trace that parents
+            // the consumer span. The queue wait time (fledge.queue.wait_ms)
+            // is recorded on the first attempt either way.
+            'producer_spans' => true,
         ],
     ],
 

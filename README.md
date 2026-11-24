@@ -103,11 +103,11 @@ Each source can be switched off under `apm.instrumentation`.
 | Source | Recorded as |
 |---|---|
 | HTTP kernel | Root transaction: route name, method, status code, user id. Back-dated to request start. |
-| Queue jobs | Consumer transaction per job. The `traceparent` travels in the job payload, so a job continues the trace that dispatched it. |
-| Artisan commands | Command transaction. Long-running or noisy commands (`queue:work`, `horizon:*`, `pulse:*`, `schedule:work`, `octane:*`, `serve`, `tinker` and friends) are skipped; see `apm.console.ignore`. |
+| Queue jobs | Consumer transaction per job. The `traceparent` travels in the job payload, so a job continues the trace that dispatched it. Each dispatch inside a trace gets a PRODUCER span `send {queue}` that parents the consumer. The first attempt carries `fledge.queue.wait_ms` (a `later()` delay is included; a `queue:retry` resets attempts, so the retried job's wait time counts from the original dispatch). Producer spans that never see `JobQueued` (database `bulk()`, bus batches on the database driver, or a push that threw) are ended at a later sweep (Looping or the terminating callback, at most 60 s for spans of a fiber still running) and carry `fledge.queue.unconfirmed`, so their duration is not the push time. |
+| Artisan commands | Command transaction. Long-running or noisy commands (`queue:work`, `horizon:*`, `pulse:*`, `schedule:work`, `torque:start`, `torque:monitor`, `torque:tail`, `resonate:start`, `octane:*`, `serve`, `tinker` and friends) are skipped; see `apm.console.ignore`. |
 | Database queries | DB span, back-dated by the query time. Statements are truncated at 2048 characters and bindings are never inlined. |
 | Cache | Cache spans for get, put and forget. Keys are not recorded by default. |
-| HTTP client | Client span per outgoing request of Laravel's `Http` client, with a `traceparent` header sent along. URLs are redacted. |
+| HTTP client | Client span per outgoing request of Laravel's `Http` client, with a `traceparent` header sent along. URLs are redacted. Spans also carry `network.peer.address`, `network.peer.port`, `network.protocol.version`, `http.response.body.size`, `fledge.http.connect_ms`, `fledge.http.tls_ms`, `fledge.http.ttfb_ms` and `fledge.http.connection_reused` (reuse and ALPN need a fledge-fiber release that reports them; without ALPN the protocol version comes from the response). `fledge.http.connect_ms` and `fledge.http.tls_ms` are omitted on a fledge-fiber release that does not report `connection_reused`, and on a failed connection. |
 | Livewire | A `livewire update` span per update request, with mount, update, hydrate, properties, call and render spans per component below it. For `FiberHandleRequests` batches each lazy card is a sibling span. |
 | Exceptions | Reported exceptions are recorded on the active span and mark the transaction as failed, which also makes the trace sampler keep it. |
 
@@ -124,6 +124,8 @@ Spans are only created inside a trace, so a query run by something that has no t
 | `apm.options.database.record_bindings` | `false` | Bindings are stripped from recorded exception messages. |
 | `apm.options.http_client.record_full_path` | `false` | Keeps the path in `url.full` verbatim; see below. |
 | `apm.options.http_client.error_on_4xx` | `false` | Only 5xx and transport errors mark a client span as failed. |
+| `apm.options.http_client.timings` | `true` | Connect, TLS and TTFB timings, peer address, protocol version and body size on client spans. |
+| `apm.options.queue.producer_spans` | `true` | PRODUCER span per dispatch inside a trace. `fledge.queue.wait_ms` on the consumer span is recorded either way. |
 
 Query bindings are never sent, request bodies and headers are never recorded, and outgoing URLs are redacted.
 

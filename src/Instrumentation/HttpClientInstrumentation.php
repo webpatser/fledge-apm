@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace Fledge\Apm\Instrumentation;
 
+use Closure;
 use Fledge\Apm\ActiveSpan;
 use Fledge\Apm\Instrumentation\Support\ExceptionRecorder;
 use Fledge\Apm\Instrumentation\Support\UrlRedaction;
 use Fledge\Apm\Tracer;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\TransferStats;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Http\Client\Factory;
 use OpenTelemetry\API\Trace\Propagation\TraceContextPropagator;
@@ -50,6 +52,16 @@ use WeakMap;
  *   verbatim. By default credentials carried in the path (Telegram bot
  *   tokens, Slack and Discord webhook secrets, long random segments) are
  *   replaced by REDACTED.
+ * - `timings` (bool, default true): wrap the request's `on_stats` option
+ *   (chaining any callback already there; a non-callable value is left in
+ *   place for the handler to reject) and copy the handler's transfer
+ *   stats onto the span: peer address and port, protocol version, body size,
+ *   connect, TLS and time-to-first-byte in milliseconds, connection reuse.
+ *   When off, the request options are left untouched.
+ *
+ * Guzzle handlers (the Fledge handler, the curl handler, the Http::fake stub)
+ * call `on_stats` before they settle the promise, on success and on failure,
+ * so the attributes land before either promise callback ends the span.
  *
  * Requests outside any trace are neither recorded nor given trace headers.
  * The package's own OTLP exporter does not use the Http client, so exports
@@ -62,6 +74,8 @@ final class HttpClientInstrumentation implements Instrumentation
     private bool $errorOn4xx = false;
 
     private bool $recordFullPath = false;
+
+    private bool $timings = true;
 
     /** @var WeakMap<Factory, true> */
     private WeakMap $patched;
@@ -76,6 +90,7 @@ final class HttpClientInstrumentation implements Instrumentation
         $this->propagate = (bool) $app['config']->get('apm.options.http_client.propagate', true);
         $this->errorOn4xx = (bool) $app['config']->get('apm.options.http_client.error_on_4xx', false);
         $this->recordFullPath = (bool) $app['config']->get('apm.options.http_client.record_full_path', false);
+        $this->timings = (bool) $app['config']->get('apm.options.http_client.timings', true);
 
         $install = function (Factory $factory) use ($tracer): void {
             if (isset($this->patched[$factory])) {
@@ -130,6 +145,12 @@ final class HttpClientInstrumentation implements Instrumentation
             $request = $this->inject($span, $request);
         }
 
+        // A non-callable on_stats is left in place for the handler to reject,
+        // exactly as it would without the instrumentation.
+        if ($this->timings && (! isset($options['on_stats']) || is_callable($options['on_stats']))) {
+            $options['on_stats'] = $this->onStats($span, $options['on_stats'] ?? null);
+        }
+
         try {
             $promise = $handler($request, $options);
         } catch (Throwable $exception) {
@@ -180,6 +201,118 @@ final class HttpClientInstrumentation implements Instrumentation
         }
 
         return $request;
+    }
+
+    /**
+     * An `on_stats` callback that records the transfer stats on the span and
+     * then calls the callback the request already carried (the framework's
+     * PendingRequest always sets one), with the same TransferStats.
+     *
+     * A Closure, because the Http::fake stub only calls Closure callbacks.
+     */
+    private function onStats(ActiveSpan $span, mixed $previous): Closure
+    {
+        return function (mixed $stats) use ($span, $previous): mixed {
+            if ($stats instanceof TransferStats) {
+                try {
+                    $this->timings($span, $stats);
+                } catch (Throwable) {
+                    // Instrumentation never breaks the request.
+                }
+            }
+
+            return is_callable($previous) ? $previous($stats) : null;
+        };
+    }
+
+    /**
+     * Copy the handler stats onto the span. Every key is optional: the stock
+     * curl handler has no `connection_reused` or `alpn`, older Fledge handler
+     * releases lack them too, and the Http::fake stub reports none at all.
+     *
+     * Timing conventions differ per handler. curl reports every time
+     * cumulatively from the transfer start (connect_time up to the TCP
+     * connect, appconnect_time up to the end of the TLS handshake). The
+     * Fledge handler reports connect_time as the whole connect including TLS
+     * and appconnect_time as the TLS handshake alone. Both are mapped to
+     * connect_ms (connection ready, TLS included) and tls_ms (handshake only).
+     *
+     * connect_ms and tls_ms are omitted when they would mislead: on a Fledge
+     * handler that does not report `connection_reused` (a reused connection
+     * repeats its original connect and TLS time there), and on a failed
+     * connection (connect_time 0 without a response), like ttfb_ms.
+     *
+     * network.protocol.version comes from `alpn`, or else from the response.
+     */
+    private function timings(ActiveSpan $span, TransferStats $stats): void
+    {
+        if ($span->hasEnded() || ! $span->isRecording()) {
+            return;
+        }
+
+        $data = $stats->getHandlerStats();
+
+        if (isset($data['primary_ip']) && is_string($data['primary_ip']) && $data['primary_ip'] !== '') {
+            $span->setAttribute('network.peer.address', $data['primary_ip']);
+        }
+
+        if (isset($data['primary_port']) && is_numeric($data['primary_port']) && (int) $data['primary_port'] > 0) {
+            $span->setAttribute('network.peer.port', (int) $data['primary_port']);
+        }
+
+        $version = isset($data['alpn']) && is_string($data['alpn']) ? match (strtolower($data['alpn'])) {
+            'h2', 'h2c' => '2',
+            'h3' => '3',
+            'http/1.1' => '1.1',
+            'http/1.0' => '1.0',
+            default => null,
+        } : null;
+
+        if ($version === null && $data !== [] && $stats->hasResponse()) {
+            $version = $stats->getResponse()?->getProtocolVersion();
+        }
+
+        if (is_string($version) && $version !== '') {
+            $span->setAttribute('network.protocol.version', $version);
+        }
+
+        if ($stats->hasResponse() && isset($data['size_download']) && is_numeric($data['size_download'])) {
+            $span->setAttribute('http.response.body.size', (int) $data['size_download']);
+        }
+
+        $connect = isset($data['connect_time']) && is_numeric($data['connect_time']) ? (float) $data['connect_time'] : null;
+        $appconnect = isset($data['appconnect_time']) && is_numeric($data['appconnect_time']) ? (float) $data['appconnect_time'] : null;
+        $fledge = ($data['handler'] ?? null) === 'fledge';
+
+        if (($fledge && ! array_key_exists('connection_reused', $data)) || (($connect ?? 0.0) === 0.0 && ! $stats->hasResponse())) {
+            $connect = $appconnect = null;
+        }
+
+        if ($connect !== null) {
+            $ready = ! $fledge && $appconnect !== null && $appconnect > $connect ? $appconnect : $connect;
+
+            $span->setAttribute('fledge.http.connect_ms', self::ms($ready));
+        }
+
+        if ($appconnect !== null) {
+            $tls = $fledge ? $appconnect : ($appconnect > 0.0 && $connect !== null ? max(0.0, $appconnect - $connect) : 0.0);
+
+            $span->setAttribute('fledge.http.tls_ms', self::ms($tls));
+        }
+
+        // 0 means no response byte arrived (a failed connection), not instant.
+        if (isset($data['starttransfer_time']) && is_numeric($data['starttransfer_time']) && (float) $data['starttransfer_time'] > 0.0) {
+            $span->setAttribute('fledge.http.ttfb_ms', self::ms((float) $data['starttransfer_time']));
+        }
+
+        if (isset($data['connection_reused']) && is_bool($data['connection_reused'])) {
+            $span->setAttribute('fledge.http.connection_reused', $data['connection_reused']);
+        }
+    }
+
+    private static function ms(float $seconds): float
+    {
+        return round($seconds * 1000, 3);
     }
 
     private function respond(ActiveSpan $span, ResponseInterface $response): void
