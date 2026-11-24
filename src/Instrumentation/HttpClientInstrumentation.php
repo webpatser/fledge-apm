@@ -6,14 +6,18 @@ namespace Fledge\Apm\Instrumentation;
 
 use Closure;
 use Fledge\Apm\ActiveSpan;
+use Fledge\Apm\Instrumentation\Support\ErrorType;
 use Fledge\Apm\Instrumentation\Support\ExceptionRecorder;
 use Fledge\Apm\Instrumentation\Support\UrlRedaction;
+use Fledge\Apm\Metrics\Metrics;
+use Fledge\Apm\Metrics\MetricsFactory;
 use Fledge\Apm\Tracer;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\TransferStats;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Http\Client\Factory;
+use OpenTelemetry\API\Metrics\HistogramInterface;
 use OpenTelemetry\API\Trace\Propagation\TraceContextPropagator;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\Context\Context;
@@ -63,12 +67,35 @@ use WeakMap;
  * call `on_stats` before they settle the promise, on success and on failure,
  * so the attributes land before either promise callback ends the span.
  *
- * Requests outside any trace are neither recorded nor given trace headers.
+ * Requests outside any trace get no span and no trace headers.
  * The package's own OTLP exporter does not use the Http client, so exports
  * are never traced.
+ *
+ * Metrics (`apm.metrics.groups.http_client`): one `http.client.request.duration`
+ * histogram record per request, in seconds, with `http.request.method`,
+ * `server.address`, `server.port`, `http.response.status_code` (with a
+ * response) and `error.type` (a failure: the exception class short name, or
+ * the status code the span marks as an error). Never the URL or path.
+ *
+ * The record is made where the span ends (the promise callbacks), not in the
+ * `on_stats` wrapper: `on_stats` is not called by every handler or path (a
+ * handler that throws first, a non-callable `on_stats`) and sits behind the
+ * `timings` option, while the metric must not depend on either. The clock is
+ * hrtime from just before the span starts to the moment it ends, so metric and
+ * span agree. It is recorded whether or not the span is sampled and for
+ * requests outside any trace.
  */
 final class HttpClientInstrumentation implements Instrumentation
 {
+    /** Semantic convention boundaries of `http.client.request.duration`, in seconds. */
+    public const array DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10];
+
+    private const array KNOWN_METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'];
+
+    private ?HistogramInterface $duration = null;
+
+    private bool $metrics = false;
+
     private bool $propagate = true;
 
     private bool $errorOn4xx = false;
@@ -91,6 +118,7 @@ final class HttpClientInstrumentation implements Instrumentation
         $this->errorOn4xx = (bool) $app['config']->get('apm.options.http_client.error_on_4xx', false);
         $this->recordFullPath = (bool) $app['config']->get('apm.options.http_client.record_full_path', false);
         $this->timings = (bool) $app['config']->get('apm.options.http_client.timings', true);
+        $this->metrics = (bool) $app['config']->get('apm.metrics.groups.http_client', true);
 
         $install = function (Factory $factory) use ($tracer): void {
             if (isset($this->patched[$factory])) {
@@ -117,70 +145,145 @@ final class HttpClientInstrumentation implements Instrumentation
      */
     private function handle(Tracer $tracer, callable $handler, RequestInterface $request, array $options): mixed
     {
-        if (! $tracer->currentSpan()->getContext()->isValid()) {
+        $traced = $tracer->currentSpan()->getContext()->isValid();
+        $measured = $this->metrics && Metrics::enabled();
+
+        if (! $traced && ! $measured) {
             return $handler($request, $options);
         }
 
+        $started = hrtime(true);
         $uri = $request->getUri();
         $method = strtoupper($request->getMethod());
         $host = $uri->getHost();
+        $port = $uri->getPort() ?? match ($uri->getScheme()) {
+            'https' => 443,
+            'http' => 80,
+            default => null,
+        };
 
-        $span = $tracer->startSpan(
-            name: trim("{$method} {$host}"),
-            kind: SpanKind::KIND_CLIENT,
-            attributes: array_filter([
-                'http.request.method' => $method,
-                'url.full' => $this->url($uri),
-                'server.address' => $host,
-                'server.port' => $uri->getPort() ?? match ($uri->getScheme()) {
-                    'https' => 443,
-                    'http' => 80,
-                    default => null,
-                },
-            ], static fn (mixed $value): bool => $value !== null && $value !== ''),
-            activate: false,
-        );
+        $span = null;
 
-        if ($this->propagate) {
-            $request = $this->inject($span, $request);
+        if ($traced) {
+            $span = $tracer->startSpan(
+                name: trim("{$method} {$host}"),
+                kind: SpanKind::KIND_CLIENT,
+                attributes: array_filter([
+                    'http.request.method' => $method,
+                    'url.full' => $this->url($uri),
+                    'server.address' => $host,
+                    'server.port' => $port,
+                ], static fn (mixed $value): bool => $value !== null && $value !== ''),
+                activate: false,
+            );
+
+            if ($this->propagate) {
+                $request = $this->inject($span, $request);
+            }
+
+            // A non-callable on_stats is left in place for the handler to reject,
+            // exactly as it would without the instrumentation.
+            if ($this->timings && (! isset($options['on_stats']) || is_callable($options['on_stats']))) {
+                $options['on_stats'] = $this->onStats($span, $options['on_stats'] ?? null);
+            }
         }
 
-        // A non-callable on_stats is left in place for the handler to reject,
-        // exactly as it would without the instrumentation.
-        if ($this->timings && (! isset($options['on_stats']) || is_callable($options['on_stats']))) {
-            $options['on_stats'] = $this->onStats($span, $options['on_stats'] ?? null);
-        }
+        $record = $measured
+            ? function (?ResponseInterface $response, mixed $reason = null) use ($method, $host, $port, $started): void {
+                $this->recordDuration($method, $host, $port, $started, $response, $reason);
+            }
+        : null;
 
         try {
             $promise = $handler($request, $options);
         } catch (Throwable $exception) {
-            $this->fail($span, $exception);
+            if ($span !== null) {
+                $this->fail($span, $exception);
+            }
+
+            $record?->__invoke(null, $exception);
 
             throw $exception;
         }
 
         if (! $promise instanceof PromiseInterface) {
-            $span->end();
+            $span?->end();
+            $record?->__invoke($promise instanceof ResponseInterface ? $promise : null);
 
             return $promise;
         }
 
         return $promise->then(
-            function (mixed $response) use ($span): mixed {
-                if ($response instanceof ResponseInterface) {
-                    $this->respond($span, $response);
+            function (mixed $response) use ($span, $record): mixed {
+                if ($span !== null) {
+                    if ($response instanceof ResponseInterface) {
+                        $this->respond($span, $response);
+                    }
+
+                    $span->end();
                 }
 
-                $span->end();
+                $record?->__invoke($response instanceof ResponseInterface ? $response : null);
 
                 return $response;
             },
-            function (mixed $reason) use ($span): PromiseInterface {
-                $this->fail($span, $reason);
+            function (mixed $reason) use ($span, $record): PromiseInterface {
+                if ($span !== null) {
+                    $this->fail($span, $reason);
+                }
+
+                $record?->__invoke(null, $reason);
 
                 return Create::rejectionFor($reason);
             },
         );
+    }
+
+    /**
+     * Record `http.client.request.duration` for one finished request. Never
+     * throws: a metric must not turn a request into a failure.
+     */
+    private function recordDuration(string $method, string $host, ?int $port, int $started, ?ResponseInterface $response, mixed $reason): void
+    {
+        try {
+            $seconds = (hrtime(true) - $started) / 1_000_000_000;
+
+            if ($response === null && is_object($reason) && method_exists($reason, 'getResponse')) {
+                $found = $reason->getResponse();
+                $response = $found instanceof ResponseInterface ? $found : null;
+            }
+
+            $status = $response?->getStatusCode();
+            $error = null;
+
+            if ($status !== null) {
+                // The status codes the span marks as errors.
+                $error = $status >= 500 || ($status >= 400 && $this->errorOn4xx) ? (string) $status : null;
+            } elseif ($reason instanceof Throwable) {
+                $error = ErrorType::shortName($reason);
+            } elseif ($reason !== null) {
+                $error = ErrorType::OTHER;
+            }
+
+            $name = 'http.client.request.duration';
+
+            $this->duration ??= Metrics::meter(MetricsFactory::INSTRUMENTATION_NAME)->createHistogram(
+                $name,
+                's',
+                'Duration of outgoing HTTP requests.',
+                ['ExplicitBucketBoundaries' => self::DURATION_BUCKETS],
+            );
+
+            $this->duration->record($seconds, Metrics::cardinality()->attributes($name, array_filter([
+                'http.request.method' => in_array($method, self::KNOWN_METHODS, true) ? $method : '_OTHER',
+                'server.address' => $host,
+                'server.port' => $port,
+                'http.response.status_code' => $status,
+                'error.type' => $error,
+            ], static fn (mixed $value): bool => $value !== null && $value !== '')));
+        } catch (Throwable) {
+            // Instrumentation never breaks the request.
+        }
     }
 
     private function inject(ActiveSpan $span, RequestInterface $request): RequestInterface

@@ -71,6 +71,8 @@ return [
     'otlp' => [
         'endpoint' => env('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4318'),
         'traces_endpoint' => env('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'),
+        // Used as is; null appends /v1/metrics to the endpoint above.
+        'metrics_endpoint' => env('OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'),
         'headers' => env('OTEL_EXPORTER_OTLP_HEADERS', ''),
         'protocol' => env('OTEL_EXPORTER_OTLP_PROTOCOL', 'http/protobuf'),
         // "gzip" (default) or "none".
@@ -125,6 +127,52 @@ return [
         'enabled' => (bool) env('APM_BREAKER_ENABLED', true),
         'seconds' => (int) env('APM_BREAKER_SECONDS', 30),
         'store' => env('APM_BREAKER_STORE'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Metrics
+    |--------------------------------------------------------------------------
+    |
+    | OTLP metrics next to the traces, through their own transport instance
+    | that shares the process-wide keep-alive connection pool with traces,
+    | to the same intake and behind the same circuit breaker. Only read when
+    | APM is enabled. Metrics are collected every `interval` seconds in
+    | long-running processes (queue workers, Octane workers, daemons); short
+    | artisan commands export nothing.
+    |
+    | `fpm` covers per-request (non-CLI) SAPIs such as PHP-FPM: with it on,
+    | each request's metrics are exported after the response. Octane on
+    | FrankenPHP is not a CLI process, so it records only with `fpm` on, and
+    | then exports every `interval` as a long-running worker, not per request.
+    |
+    | Temporality: "delta" (default), "cumulative" or "lowmemory".
+    | cardinality_limit caps the attribute sets per instrument; further sets
+    | are recorded as {otel.metric.overflow: true}.
+    |
+    */
+
+    'metrics' => [
+        'enabled' => (bool) env('APM_METRICS_ENABLED', false),
+        'interval' => (int) env('APM_METRICS_INTERVAL', 60),
+        'temporality' => 'delta',
+        'cardinality_limit' => 200,
+        'fpm' => (bool) env('APM_METRICS_FPM', false),
+        'groups' => [
+            'http_client' => true,
+            'queue' => true,
+            'queue_backlog' => true,
+            'runtime' => true,
+            'database_pool' => true,
+            'loop' => true,
+        ],
+        'queue_backlog' => [
+            // Connection name to queue names, e.g. ['redis' => ['default', 'mail']].
+            'queues' => [],
+            // Cache store for the lock that picks one reporting worker; null
+            // for the default store.
+            'lock_store' => null,
+        ],
     ],
 
     /*

@@ -113,6 +113,44 @@ Each source can be switched off under `apm.instrumentation`.
 
 Spans are only created inside a trace, so a query run by something that has no transaction (a boot-time call, say) is skipped instead of creating orphan traces.
 
+## Metrics
+
+Next to the traces the package can export OTLP metrics. They are off until you set `APM_METRICS_ENABLED=true` (APM itself has to be on too) and go to the same intake as the traces through their own transport instance, which shares the process-wide keep-alive connection pool with traces, behind the same circuit breaker. The endpoint is `OTEL_EXPORTER_OTLP_ENDPOINT` plus `/v1/metrics`, or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` as is. Headers, protocol, compression and timeouts are shared with the traces. A metrics export has no retries: the next interval carries fresh deltas.
+
+| Setting | Env var | Default | What it does |
+|---|---|---|---|
+| `apm.metrics.enabled` | `APM_METRICS_ENABLED` | `false` | Master switch for metrics. |
+| `apm.metrics.interval` | `APM_METRICS_INTERVAL` | `60` | Seconds between exports in a long-running process. |
+| `apm.metrics.temporality` | none | `delta` | `delta`, `cumulative` or `lowmemory`. |
+| `apm.metrics.cardinality_limit` | none | `200` | Distinct attribute sets per instrument per interval. |
+| `apm.metrics.fpm` | `APM_METRICS_FPM` | `false` | Record metrics under per-request (non-CLI) SAPIs such as PHP-FPM and export each request's metrics. |
+| `apm.metrics.groups.http_client` | none | `true` | HTTP client instruments. |
+| `apm.metrics.groups.queue` | none | `true` | Job instruments. |
+| `apm.metrics.groups.queue_backlog`, `runtime`, `database_pool`, `loop` | none | `true` | Reserved for later releases. |
+| `apm.metrics.queue_backlog.queues`, `lock_store` | none | `[]`, `null` | Reserved for later releases. |
+| `apm.otlp.metrics_endpoint` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | none | Full metrics URL, wins over the base endpoint. |
+
+Process model. A long-running process (a queue worker, an Octane worker, a daemon marked with `Metrics::markLongRunning()`, or any CLI process that is still alive after one interval on the event loop) exports every `APM_METRICS_INTERVAL` seconds and once more when it stops. A short artisan command exports nothing and never waits at exit. An interval without a single data point sends nothing.
+
+`APM_METRICS_FPM` covers per-request (non-CLI) SAPIs such as PHP-FPM. With it off nothing is recorded there; with it on each request's values go out after the response was sent. Each such request builds its own meter provider; the resource detectors it shares with the tracer run once per request. Octane on FrankenPHP is not a CLI process either, so it needs `APM_METRICS_FPM` to record; its first request then marks the worker long-running, and it exports every interval instead of per request.
+
+Temporality is delta by default: each export carries what happened since the previous one, so a counter is the sum of its documents. Histograms use explicit bucket boundaries in seconds.
+
+Cardinality is capped per instrument: after `apm.metrics.cardinality_limit` distinct attribute sets in one interval, further sets are recorded as `otel.metric.overflow=true` and the first overflow of an instrument is logged once. That bounds the documents Elasticsearch receives per interval.
+
+With metrics enabled, traces and metrics both carry `service.instance.id` and `fledge.process.role`. On traces the role is the SAPI default (`cli`, `fpm` or `web`) and the instance id is the pid of the process that built the tracer; detected and marked roles (for example `queue`, `octane`, or a role a package sets through `Metrics::markLongRunning()`) and the pids of forked children appear on metrics only. APM Server maps `service.instance.id` to `service.node.name`, so Kibana lists one instance per process on metrics. With metrics off, traces carry neither.
+
+| Instrument | Kind | Unit | Attributes |
+|---|---|---|---|
+| `http.client.request.duration` | histogram, boundaries 0.005 to 10 | `s` | `http.request.method`, `server.address`, `server.port`, `http.response.status_code`, `error.type` |
+| `messaging.process.duration` | histogram, boundaries 0.005 to 600 | `s` | `messaging.system`, `messaging.destination.name`, `laravel.queue.connection`, `laravel.job.name`, `error.type` |
+| `messaging.client.consumed.messages` | counter | `{message}` | `messaging.system`, `messaging.destination.name`, `laravel.queue.connection`, `laravel.job.name` |
+| `fledge.queue.job.wait_time` | histogram, boundaries 0.01 to 3600, first attempt only | `s` | `messaging.system`, `messaging.destination.name`, `laravel.queue.connection`, `laravel.job.name` |
+| `fledge.queue.job.retries` | counter | `{job}` | as above, plus `error.type` |
+| `fledge.queue.job.failures` | counter | `{job}` | as above, plus `error.type` |
+
+`error.type` is the exception class short name, or the status code for a response the client span marks as an error (5xx, and 4xx with `error_on_4xx`). URLs, paths and job ids are never attributes. The HTTP and job metrics are recorded whether or not the span is sampled, and `options.http_client.timings` does not affect them, but only while `apm.instrumentation.http_client` and `apm.instrumentation.queue` are on. Wait time is measured from the dispatch on the first attempt only, so a `later()` delay is included; sync queue jobs run inside the dispatch and record no wait time metric.
+
 ## Privacy defaults
 
 | Option | Default | Notes |

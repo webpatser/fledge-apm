@@ -42,6 +42,13 @@ final class TracerFactory
 
     public const int DEFAULT_CONNECT_TIMEOUT_MS = 1000;
 
+    public const string SERVICE_INSTANCE_ID = 'service.instance.id';
+
+    public const string PROCESS_ROLE = 'fledge.process.role';
+
+    /** @var array{int|false, ResourceInfo}|null the detected resource and the pid it was built in */
+    private static ?array $defaultResource = null;
+
     /**
      * @param  array<string, mixed>  $config
      * @param  ExportCircuitBreaker|null  $breaker  shared export breaker (the provider builds one from `apm.breaker`); null for none
@@ -76,7 +83,7 @@ final class TracerFactory
         $provider = new TracerProvider(
             spanProcessors: [$processor],
             sampler: self::sampler($config),
-            resource: self::resource($config),
+            resource: self::resource($config, process: (bool) ($config['metrics']['enabled'] ?? false)),
         );
 
         return new Tracer(
@@ -191,6 +198,23 @@ final class TracerFactory
     }
 
     /**
+     * OTEL_EXPORTER_OTLP_METRICS_ENDPOINT is used as is; the generic
+     * OTEL_EXPORTER_OTLP_ENDPOINT gets the `/v1/metrics` signal path.
+     *
+     * @param  array<string, mixed>  $otlp
+     */
+    public static function metricsEndpoint(array $otlp): string
+    {
+        $metrics = $otlp['metrics_endpoint'] ?? null;
+
+        if (is_string($metrics) && $metrics !== '') {
+            return $metrics;
+        }
+
+        return rtrim((string) ($otlp['endpoint'] ?? 'http://localhost:4318'), '/').'/v1/metrics';
+    }
+
+    /**
      * OTLP/HTTP encodings that need no ext-protobuf (google/protobuf's
      * pure-PHP runtime covers both; ext-protobuf only makes them faster).
      * Unknown values (`grpc`) fall back to protobuf.
@@ -234,18 +258,75 @@ final class TracerFactory
     }
 
     /**
+     * The resource of both signals. The metric resource always carries
+     * `service.instance.id` and `fledge.process.role`; the trace resource
+     * only while `metrics.enabled` is on (APM Server maps the instance id to
+     * `service.node.name`), so traces stay as they were with metrics off.
+     *
+     * `service.instance.id` is host:pid unless OTEL_RESOURCE_ATTRIBUTES or a
+     * detector already set one. The pid is read here, so a process that forks
+     * after building its Tracer keeps the parent's id on its traces.
+     *
      * @param  array<string, mixed>  $config
+     * @param  string|null  $role  `fledge.process.role`; null for defaultRole()
+     * @param  bool  $process  add the instance id and the role
      */
-    public static function resource(array $config): ResourceInfo
+    public static function resource(array $config, ?string $role = null, bool $process = true): ResourceInfo
     {
         $service = $config['service'] ?? [];
+        $default = self::defaultResource();
 
-        $attributes = array_filter([
+        $attributes = [
             ResourceAttributes::SERVICE_NAME => $service['name'] ?? null,
             ResourceAttributes::SERVICE_VERSION => $service['version'] ?? null,
             'deployment.environment.name' => $service['environment'] ?? null,
-        ], static fn (mixed $value): bool => is_string($value) && $value !== '');
+        ];
 
-        return ResourceInfoFactory::defaultResource()->merge(ResourceInfo::create(Attributes::create($attributes)));
+        if ($process) {
+            $attributes[self::SERVICE_INSTANCE_ID] = $default->getAttributes()->has(self::SERVICE_INSTANCE_ID) ? null : self::serviceInstanceId();
+            $attributes[self::PROCESS_ROLE] = $role !== null && $role !== '' ? $role : self::defaultRole();
+        }
+
+        $attributes = array_filter($attributes, static fn (mixed $value): bool => is_string($value) && $value !== '');
+
+        return $default->merge(ResourceInfo::create(Attributes::create($attributes)));
+    }
+
+    /**
+     * The SDK's detected resource, built once per process (keyed by pid, so
+     * a forked child detects its own). The tracer and the metrics provider
+     * share it, so building both (per request with `metrics.fpm`) runs the
+     * detectors once.
+     */
+    private static function defaultResource(): ResourceInfo
+    {
+        $pid = getmypid();
+
+        if (self::$defaultResource === null || self::$defaultResource[0] !== $pid) {
+            self::$defaultResource = [$pid, ResourceInfoFactory::defaultResource()];
+        }
+
+        return self::$defaultResource[1];
+    }
+
+    /**
+     * host:pid of this process.
+     */
+    public static function serviceInstanceId(): string
+    {
+        return (gethostname() ?: 'localhost').':'.getmypid();
+    }
+
+    /**
+     * The process role before anything marks it otherwise: "fpm" under
+     * PHP-FPM, "cli" for artisan and workers, "web" for other SAPIs.
+     */
+    public static function defaultRole(): string
+    {
+        return match (PHP_SAPI) {
+            'cli', 'phpdbg' => 'cli',
+            'fpm-fcgi' => 'fpm',
+            default => 'web',
+        };
     }
 }

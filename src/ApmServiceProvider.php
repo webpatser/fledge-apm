@@ -17,13 +17,17 @@ use Fledge\Apm\Instrumentation\HttpInstrumentation;
 use Fledge\Apm\Instrumentation\Instrumentation;
 use Fledge\Apm\Instrumentation\LivewireInstrumentation;
 use Fledge\Apm\Instrumentation\QueueInstrumentation;
+use Fledge\Apm\Metrics\Metrics;
 use Fledge\Loop;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Events\WorkerStarting;
 use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Support\ServiceProvider;
 use OpenTelemetry\API\Behavior\Internal\Logging;
+use OpenTelemetry\API\Metrics\MeterProviderInterface;
+use OpenTelemetry\API\Metrics\Noop\NoopMeterProvider;
 use Psr\Log\LoggerInterface;
 use Throwable;
 
@@ -90,6 +94,43 @@ final class ApmServiceProvider extends ServiceProvider
         });
 
         $this->app->singleton(Propagation::class);
+
+        $this->app->singleton(Metrics::class, static function ($app): Metrics {
+            $config = (array) $app['config']->get('apm', []);
+
+            return new Metrics(
+                $config,
+                breaker: ($config['enabled'] ?? false) && self::breakerEnabled($config) ? $app->make(ExportCircuitBreaker::class) : null,
+                log: $app->bound(ThrottledLogWriter::class) ? $app->make(ThrottledLogWriter::class) : null,
+                storage: $app->make(FiberContextStorage::class),
+            );
+        });
+
+        $this->registerMeterProvider();
+    }
+
+    /**
+     * The binding torque, resonate and other packages use as their guard: it
+     * exists only while APM and metrics are enabled. It resolves to the real
+     * MeterProvider in a process that records metrics (CLI, or PHP-FPM with
+     * metrics.fpm) and to a no-op provider otherwise; resolving never throws.
+     * Exporting still waits for long-running detection (see Metrics).
+     */
+    private function registerMeterProvider(): void
+    {
+        $config = (array) $this->app['config']->get('apm', []);
+
+        if (! ($config['enabled'] ?? false) || ! ($config['metrics']['enabled'] ?? false)) {
+            return;
+        }
+
+        $this->app->bind(MeterProviderInterface::class, static function ($app): MeterProviderInterface {
+            try {
+                return $app->make(Metrics::class)->provider();
+            } catch (Throwable) {
+                return new NoopMeterProvider;
+            }
+        });
     }
 
     public function boot(): void
@@ -113,6 +154,7 @@ final class ApmServiceProvider extends ServiceProvider
         }
 
         $this->registerFlushing($tracer);
+        $this->registerMetrics();
         $this->registerContextResets($tracer);
         $this->registerInstrumentations($tracer);
     }
@@ -136,11 +178,16 @@ final class ApmServiceProvider extends ServiceProvider
         $config = (array) $app['config']->get('apm', []);
         $breaker = self::breakerEnabled($config) ? $app->make(ExportCircuitBreaker::class) : null;
 
-        Logging::setLogWriter(new ThrottledLogWriter(
+        $writer = new ThrottledLogWriter(
             static fn (): LoggerInterface => $app->make('log'),
             $breaker,
             max(1.0, (float) ($config['breaker']['seconds'] ?? 30)),
-        ));
+        );
+
+        // Also the writer for metric cardinality overflow lines.
+        $app->instance(ThrottledLogWriter::class, $writer);
+
+        Logging::setLogWriter($writer);
     }
 
     private function warnMissingPropagation(): void
@@ -282,6 +329,76 @@ final class ApmServiceProvider extends ServiceProvider
                 $tracer->flushInBackground(await: false);
             }
         }));
+    }
+
+    /**
+     * Metrics cadence (see Metrics for the process model). Nothing is wired
+     * when metrics are off or the process records none (PHP-FPM without
+     * metrics.fpm), so traces behave exactly as before.
+     *
+     * - Long-running detection: Looping and WorkerStarting (queue workers),
+     *   Octane's RequestReceived (under any SAPI, FrankenPHP included),
+     *   Metrics::markLongRunning(), or surviving one interval on the collect
+     *   timer.
+     * - Cadence: the unreferenced collect timer while the Fledge event loop
+     *   runs, plus a collect on Looping once an interval has passed, for
+     *   workers without a running loop (awaited there, background otherwise).
+     * - Final flush on WorkerStopping (queue and Octane) and at shutdown.
+     * - metrics.fpm: in a per-request (non-CLI) process not marked
+     *   long-running, each request's deltas are exported from the
+     *   terminating callback, after the response was sent.
+     */
+    private function registerMetrics(): void
+    {
+        $metrics = $this->app->make(Metrics::class);
+
+        if (! $metrics->recording()) {
+            return;
+        }
+
+        $metrics->startTimer();
+
+        $events = $this->app->make(Dispatcher::class);
+
+        // Must return void: a Looping listener returning false pauses the worker.
+        $events->listen(Looping::class, static function () use ($metrics): void {
+            $metrics->detect(Metrics::ROLE_QUEUE);
+            $metrics->collectIfDue();
+        });
+
+        $events->listen(WorkerStarting::class, static function () use ($metrics): void {
+            $metrics->detect(Metrics::ROLE_QUEUE);
+        });
+
+        $events->listen(WorkerStopping::class, static function () use ($metrics): void {
+            $metrics->finish();
+        });
+
+        if (class_exists(self::OCTANE_REQUEST_RECEIVED)) {
+            $events->listen(self::OCTANE_REQUEST_RECEIVED, static function () use ($metrics): void {
+                $metrics->detectOctane();
+            });
+        }
+
+        if (class_exists(self::OCTANE_WORKER_STOPPING)) {
+            $events->listen(self::OCTANE_WORKER_STOPPING, static function () use ($metrics): void {
+                $metrics->finish();
+            });
+        }
+
+        $this->app->terminating(static function () use ($metrics): void {
+            if ($metrics->perRequest()) {
+                $metrics->collect();
+
+                return;
+            }
+
+            // The loop may start after boot; an Octane worker collects
+            // between requests once an interval has passed. Short artisan
+            // commands are not long-running: both calls do nothing.
+            $metrics->startTimer();
+            $metrics->collectIfDue();
+        });
     }
 
     /**

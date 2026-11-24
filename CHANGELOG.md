@@ -2,6 +2,21 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-11-24
+
+### Added
+
+- An OTLP metrics signal next to the traces, off by default (`APM_METRICS_ENABLED`). Metrics use their own transport instance, which shares the process-wide keep-alive connection pool with traces, and go to the same intake (`/v1/metrics`, or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`), behind the same circuit breaker, with delta temporality and no retries. Config keys under `apm.metrics`: `enabled`, `interval` (`APM_METRICS_INTERVAL`, 60 s), `temporality` (`delta`, `cumulative` or `lowmemory`), `cardinality_limit` (200), `fpm` (`APM_METRICS_FPM`), `groups.{http_client,queue,queue_backlog,runtime,database_pool,loop}` and `queue_backlog.{queues,lock_store}`; `apm.otlp.metrics_endpoint` holds the endpoint override.
+- Process model: a long-running process (queue workers, Octane workers under any SAPI, daemons, anything marked with `Metrics::markLongRunning()`) exports every interval and once more when it stops; short artisan commands export nothing. `APM_METRICS_FPM` covers per-request (non-CLI) SAPIs such as PHP-FPM: only with it on are metrics recorded there, and each request's metrics are exported after the response. Octane on FrankenPHP is not a CLI process, so it needs `APM_METRICS_FPM` too, and then exports every interval as a long-running worker. An interval without a single data point sends nothing.
+- The package binds `OpenTelemetry\API\Metrics\MeterProviderInterface` in the container and exposes `Fledge\Apm\Metrics\Metrics` (`meter()`, `enabled()`, `markLongRunning()`, `cardinality()`) so other packages can record through the same pipeline. Both are no-ops while metrics are off.
+- Cardinality limit: every instrument keeps at most `apm.metrics.cardinality_limit` distinct attribute sets per export interval; further sets are recorded as `otel.metric.overflow=true`, and the first overflow of an instrument is logged once.
+- Instruments: `http.client.request.duration` (histogram, `s`), `messaging.process.duration` (histogram, `s`), `messaging.client.consumed.messages` (counter), `fledge.queue.job.wait_time` (histogram, `s`, first attempt only, never for the sync queue), `fledge.queue.job.retries` and `fledge.queue.job.failures` (counters). Attributes are limited to `http.request.method`, `server.address`, `server.port`, `http.response.status_code`, `error.type`, `messaging.system`, `messaging.destination.name`, `laravel.queue.connection` and `laravel.job.name`; never a URL, path or job id. Toggle with `apm.metrics.groups.http_client` and `apm.metrics.groups.queue`; they are recorded only while `apm.instrumentation.http_client` and `apm.instrumentation.queue` are on. All histograms use explicit boundaries in seconds.
+
+### Changed
+
+- With metrics enabled, traces and metrics both carry `service.instance.id` and `fledge.process.role`. On traces the role is the SAPI default (`cli`, `fpm` or `web`) and the instance id is the pid of the process that built the tracer; detected and marked roles (for example `queue`, `octane`, or a role a package sets through `Metrics::markLongRunning()`) and the pids of forked children appear on metrics only, so APM Server's `service.node.name` is `host:pid` there. With metrics off, traces carry neither and export as before.
+- `open-telemetry/sdk` is required at `^1.17` and `open-telemetry/exporter-otlp` at `^1.6`.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

@@ -6,7 +6,10 @@ namespace Fledge\Apm\Instrumentation;
 
 use Fiber;
 use Fledge\Apm\ActiveSpan;
+use Fledge\Apm\Instrumentation\Support\ErrorType;
 use Fledge\Apm\Instrumentation\Support\ExceptionRecorder;
+use Fledge\Apm\Metrics\Metrics;
+use Fledge\Apm\Metrics\MetricsFactory;
 use Fledge\Apm\Tracer;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Queue\Job;
@@ -15,8 +18,12 @@ use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\JobQueued;
+use Illuminate\Queue\Events\JobReleasedAfterException;
 use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Jobs\SyncJob;
 use Illuminate\Queue\Queue;
+use OpenTelemetry\API\Metrics\CounterInterface;
+use OpenTelemetry\API\Metrics\HistogramInterface;
 use OpenTelemetry\API\Trace\Propagation\TraceContextPropagator;
 use OpenTelemetry\API\Trace\Span;
 use OpenTelemetry\API\Trace\SpanKind;
@@ -54,9 +61,38 @@ use WeakReference;
  * `fledge.queue.wait_ms` on the first attempt; JobProcessed, JobFailed and
  * JobExceptionOccurred end it. Whichever arrives first ends the span and the
  * others are no-ops, so it is ended exactly once per attempt.
+ *
+ * Metrics (`apm.metrics.groups.queue`), recorded whether or not the consumer
+ * span is sampled, with only `messaging.system`, `messaging.destination.name`,
+ * `laravel.queue.connection` and `laravel.job.name` (plus `error.type`, the
+ * exception class short name, on failures); never the job id:
+ * - `messaging.client.consumed.messages` counter: one per attempt started
+ * - `messaging.process.duration` histogram (s): one per attempt, at the end
+ * - `fledge.queue.job.wait_time` histogram (s): first attempt only, from
+ *   `apmQueuedAt`, the rule `fledge.queue.wait_ms` follows; never for the
+ *   sync queue, whose jobs run inside the dispatch
+ * - `fledge.queue.job.retries` counter: JobReleasedAfterException
+ * - `fledge.queue.job.failures` counter: JobFailed
  */
 final class QueueInstrumentation implements Instrumentation
 {
+    /** Boundaries of `messaging.process.duration`, in seconds: 5 ms to 10 minutes. */
+    public const array PROCESS_DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600];
+
+    /** Boundaries of `fledge.queue.job.wait_time`, in seconds: 10 ms to 1 hour. */
+    public const array WAIT_TIME_BUCKETS = [0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800, 3600];
+
+    private bool $metrics = false;
+
+    /** @var array<string, CounterInterface> */
+    private array $counters = [];
+
+    /** @var array<string, HistogramInterface> */
+    private array $histograms = [];
+
+    /** @var WeakMap<Job, array{int|float, array<non-empty-string, string>}> start time and attributes of the attempt being timed */
+    private WeakMap $timed;
+
     /** Open producer spans per instance; beyond this a dispatch gets no producer span. */
     private const int MAX_OPEN_PRODUCERS = 256;
 
@@ -87,12 +123,14 @@ final class QueueInstrumentation implements Instrumentation
     {
         $this->open = new WeakMap;
         $this->producedBy = new WeakMap;
+        $this->timed = new WeakMap;
     }
 
     public function register(Application $app, Tracer $tracer): void
     {
         $this->tracer = $tracer;
         $this->producerSpans = (bool) $app['config']->get('apm.options.queue.producer_spans', true);
+        $this->metrics = (bool) $app['config']->get('apm.metrics.groups.queue', true);
 
         self::$injecting = $tracer;
 
@@ -110,6 +148,7 @@ final class QueueInstrumentation implements Instrumentation
         $events->listen(JobProcessed::class, $this->processed(...));
         $events->listen(JobFailed::class, $this->failed(...));
         $events->listen(JobExceptionOccurred::class, $this->failed(...));
+        $events->listen(JobReleasedAfterException::class, $this->released(...));
 
         // Must return void: a Looping listener returning false pauses the worker.
         $events->listen(Looping::class, function (): void {
@@ -298,6 +337,9 @@ final class QueueInstrumentation implements Instrumentation
         /** @var string|int|null $jobId */
         $jobId = $job->getJobId();
         $attempts = $job->attempts();
+        $waitMs = $this->waitMs($payload, $attempts);
+
+        $this->startMetrics($job, $event->connectionName, $waitMs);
 
         $attributes = array_filter([
             'messaging.system' => 'laravel-queue',
@@ -307,7 +349,7 @@ final class QueueInstrumentation implements Instrumentation
             'laravel.queue.connection' => $event->connectionName,
             'laravel.job.name' => $job->resolveName(),
             'laravel.job.attempts' => $attempts,
-            'fledge.queue.wait_ms' => $this->waitMs($payload, $attempts),
+            'fledge.queue.wait_ms' => $waitMs,
         ], static fn (mixed $value): bool => $value !== null && $value !== '');
 
         $this->open[$job] = $this->tracer->startSpan(
@@ -386,10 +428,143 @@ final class QueueInstrumentation implements Instrumentation
     private function failed(JobFailed|JobExceptionOccurred $event): void
     {
         $this->end($event->job, $event->exception);
+
+        if ($event instanceof JobFailed) {
+            $this->countJob('fledge.queue.job.failures', 'Jobs that failed for good.', $event->job, $event->connectionName, $event->exception);
+        }
+    }
+
+    private function released(JobReleasedAfterException $event): void
+    {
+        $exception = $event->exception instanceof Throwable ? $event->exception : null;
+
+        $this->countJob('fledge.queue.job.retries', 'Jobs released back onto the queue after an exception.', $event->job, $event->connectionName, $exception);
+    }
+
+    /**
+     * Whether this process records the queue metrics. Instruments are only
+     * created while it does, so none is ever bound to a no-op meter.
+     */
+    private function measuring(): bool
+    {
+        return $this->metrics && Metrics::enabled();
+    }
+
+    /**
+     * @return array<non-empty-string, string>
+     */
+    private function metricAttributes(mixed $job, mixed $connection): array
+    {
+        $queue = $job instanceof Job ? $job->getQueue() : null;
+        $name = $job instanceof Job ? $job->resolveName() : null;
+
+        /** @var array<non-empty-string, string> $attributes */
+        $attributes = array_filter([
+            'messaging.system' => 'laravel-queue',
+            'messaging.destination.name' => is_string($queue) ? $queue : null,
+            'laravel.queue.connection' => is_string($connection) ? $connection : null,
+            'laravel.job.name' => is_string($name) ? $name : null,
+        ], static fn (?string $value): bool => $value !== null && $value !== '');
+
+        return $attributes;
+    }
+
+    /**
+     * The attempt starts: count it, record its wait time (first attempt
+     * only) and remember when it began and under which attributes.
+     */
+    private function startMetrics(Job $job, mixed $connection, ?float $waitMs): void
+    {
+        if (! $this->measuring() || isset($this->timed[$job])) {
+            return;
+        }
+
+        try {
+            $attributes = $this->metricAttributes($job, $connection);
+            $guard = Metrics::cardinality();
+
+            $this->timed[$job] = [hrtime(true), $attributes];
+
+            $name = 'messaging.client.consumed.messages';
+            $this->counter($name, '{message}', 'Jobs received by a worker, one per attempt.')->add(1, $guard->attributes($name, $attributes));
+
+            // A sync job runs inside its dispatch: its near-zero wait is no sample.
+            if ($waitMs !== null && ! $job instanceof SyncJob) {
+                $name = 'fledge.queue.job.wait_time';
+                $this->histogram($name, 'Time from dispatch to the first attempt, a later() delay included.', self::WAIT_TIME_BUCKETS)
+                    ->record($waitMs / 1000, $guard->attributes($name, $attributes));
+            }
+        } catch (Throwable) {
+            // Instrumentation never breaks the worker.
+        }
+    }
+
+    /**
+     * The attempt ends (processed, failed or released after an exception,
+     * whichever event comes first).
+     */
+    private function endMetrics(Job $job, ?Throwable $exception): void
+    {
+        $timing = $this->timed[$job] ?? null;
+
+        if ($timing === null) {
+            return;
+        }
+
+        unset($this->timed[$job]);
+
+        try {
+            [$started, $attributes] = $timing;
+
+            if ($exception !== null) {
+                $attributes['error.type'] = ErrorType::shortName($exception);
+            }
+
+            $name = 'messaging.process.duration';
+            $this->histogram($name, 'Duration of one attempt to process a job.', self::PROCESS_DURATION_BUCKETS)
+                ->record((hrtime(true) - $started) / 1_000_000_000, Metrics::cardinality()->attributes($name, $attributes));
+        } catch (Throwable) {
+            // Instrumentation never breaks the worker.
+        }
+    }
+
+    private function countJob(string $name, string $description, mixed $job, mixed $connection, mixed $exception): void
+    {
+        if (! $this->measuring()) {
+            return;
+        }
+
+        try {
+            $attributes = $this->metricAttributes($job, $connection);
+
+            if ($exception instanceof Throwable) {
+                $attributes['error.type'] = ErrorType::shortName($exception);
+            }
+
+            $this->counter($name, '{job}', $description)->add(1, Metrics::cardinality()->attributes($name, $attributes));
+        } catch (Throwable) {
+            // Instrumentation never breaks the worker.
+        }
+    }
+
+    private function counter(string $name, string $unit, string $description): CounterInterface
+    {
+        return $this->counters[$name] ??= Metrics::meter(MetricsFactory::INSTRUMENTATION_NAME)->createCounter($name, $unit, $description);
+    }
+
+    /**
+     * @param  list<int|float>  $boundaries
+     */
+    private function histogram(string $name, string $description, array $boundaries): HistogramInterface
+    {
+        return $this->histograms[$name] ??= Metrics::meter(MetricsFactory::INSTRUMENTATION_NAME)
+            ->createHistogram($name, 's', $description, ['ExplicitBucketBoundaries' => $boundaries]);
     }
 
     private function end(Job $job, ?Throwable $exception): void
     {
+        $this->endMetrics($job, $exception);
+
         $active = $this->open[$job] ?? null;
 
         if ($active === null) {
