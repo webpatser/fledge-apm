@@ -17,6 +17,7 @@ use OpenTelemetry\SDK\Metrics\MeterProvider;
 use OpenTelemetry\SDK\Metrics\MetricExporter\InMemoryExporter;
 use OpenTelemetry\SDK\Metrics\TemporalityPreference;
 
+use function Fledge\Async\async;
 use function Fledge\Async\delay;
 
 /**
@@ -99,6 +100,11 @@ it('starts exporting after Looping, on the next collect, as a queue process', fu
     [$metrics, $exporter] = bootMetricsApm(['interval' => 1]);
 
     recordTestCount(2);
+
+    // A stock queue:work: WorkerStarting, a loop turn for its signal
+    // watchers, then the first Looping, all from {main}.
+    app('events')->dispatch(new WorkerStarting('sync', 'default', null));
+    delay(0);
     app('events')->dispatch(new Looping('sync', 'default'));
 
     expect($metrics->longRunning())->toBeTrue()
@@ -139,6 +145,8 @@ it('detects a worker on WorkerStarting and a marked process through markLongRunn
 it('flushes once more when the worker stops', function () {
     [$metrics, $exporter] = bootMetricsApm();
 
+    app('events')->dispatch(new WorkerStarting('sync', 'default', null));
+    delay(0);
     app('events')->dispatch(new Looping('sync', 'default'));
     recordTestCount(3);
     event(new WorkerStopping(0));
@@ -195,9 +203,9 @@ it('treats an Octane worker under a non-CLI SAPI as long-running, not per reques
 });
 
 it('marks a process that survives one interval on the loop timer as long-running', function () {
-    delay(0); // the event loop now runs, as in the Fledge server and torque workers
-
-    [$metrics, $exporter] = bootMetricsApm(['interval' => 1]);
+    // Booted inside a fiber of the running loop, as in the Fledge server and
+    // torque workers; from {main} no timer arms for a process nobody marked.
+    [$metrics, $exporter] = async(fn (): array => bootMetricsApm(['interval' => 1]))->await();
     recordTestCount(6);
 
     expect($metrics->longRunning())->toBeFalse();

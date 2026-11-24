@@ -18,6 +18,8 @@ use Fledge\Apm\Instrumentation\Instrumentation;
 use Fledge\Apm\Instrumentation\LivewireInstrumentation;
 use Fledge\Apm\Instrumentation\QueueInstrumentation;
 use Fledge\Apm\Metrics\Metrics;
+use Fledge\Apm\Metrics\QueueBacklogObserver;
+use Fledge\Apm\Metrics\RuntimeObserver;
 use Fledge\Loop;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Contracts\Events\Dispatcher;
@@ -340,9 +342,12 @@ final class ApmServiceProvider extends ServiceProvider
      *   Octane's RequestReceived (under any SAPI, FrankenPHP included),
      *   Metrics::markLongRunning(), or surviving one interval on the collect
      *   timer.
-     * - Cadence: the unreferenced collect timer while the Fledge event loop
-     *   runs, plus a collect on Looping once an interval has passed, for
-     *   workers without a running loop (awaited there, background otherwise).
+     * - Cadence: the unreferenced collect timer, armed only inside a fiber of
+     *   the running Fledge event loop (or on the next loop turn for a marked
+     *   process), plus a collect on Looping once an interval has passed
+     *   (awaited from {main}, background inside a fiber). Looping or
+     *   RequestReceived fired outside any fiber marks the process
+     *   event-driven: no loop timers there (see Metrics::hostEvent()).
      * - Final flush on WorkerStopping (queue and Octane) and at shutdown.
      * - metrics.fpm: in a per-request (non-CLI) process not marked
      *   long-running, each request's deltas are exported from the
@@ -356,13 +361,22 @@ final class ApmServiceProvider extends ServiceProvider
             return;
         }
 
+        $backlog = $this->registerQueueBacklog($metrics);
+        $runtime = $this->registerRuntime($metrics);
+
         $metrics->startTimer();
 
         $events = $this->app->make(Dispatcher::class);
 
         // Must return void: a Looping listener returning false pauses the worker.
-        $events->listen(Looping::class, static function () use ($metrics): void {
+        // Looping outside any fiber marks a stock worker (no loop timers);
+        // torque fires it from its reader fibers. The backlog sample runs
+        // after detection (which may create the observer) and before the
+        // collect, so a due collect exports the numbers of this Looping.
+        $events->listen(Looping::class, static function () use ($metrics, $backlog): void {
+            $metrics->hostEvent();
             $metrics->detect(Metrics::ROLE_QUEUE);
+            $backlog->observer?->sampleIfDue();
             $metrics->collectIfDue();
         });
 
@@ -370,23 +384,28 @@ final class ApmServiceProvider extends ServiceProvider
             $metrics->detect(Metrics::ROLE_QUEUE);
         });
 
-        $events->listen(WorkerStopping::class, static function () use ($metrics): void {
+        $events->listen(WorkerStopping::class, static function () use ($metrics, $backlog, $runtime): void {
             $metrics->finish();
+            $backlog->observer?->stop();
+            $runtime->observer?->stop();
         });
 
         if (class_exists(self::OCTANE_REQUEST_RECEIVED)) {
             $events->listen(self::OCTANE_REQUEST_RECEIVED, static function () use ($metrics): void {
+                $metrics->hostEvent();
                 $metrics->detectOctane();
             });
         }
 
         if (class_exists(self::OCTANE_WORKER_STOPPING)) {
-            $events->listen(self::OCTANE_WORKER_STOPPING, static function () use ($metrics): void {
+            $events->listen(self::OCTANE_WORKER_STOPPING, static function () use ($metrics, $backlog, $runtime): void {
                 $metrics->finish();
+                $backlog->observer?->stop();
+                $runtime->observer?->stop();
             });
         }
 
-        $this->app->terminating(static function () use ($metrics): void {
+        $this->app->terminating(static function () use ($metrics, $backlog): void {
             if ($metrics->perRequest()) {
                 $metrics->collect();
 
@@ -395,10 +414,94 @@ final class ApmServiceProvider extends ServiceProvider
 
             // The loop may start after boot; an Octane worker collects
             // between requests once an interval has passed. Short artisan
-            // commands are not long-running: both calls do nothing.
+            // commands are not long-running: all three calls do nothing.
+            $backlog->observer?->sampleIfDue();
             $metrics->startTimer();
             $metrics->collectIfDue();
         });
+    }
+
+    /**
+     * The queue backlog gauges (see QueueBacklogObserver), behind
+     * `metrics.groups.queue_backlog` and only when
+     * `metrics.queue_backlog.queues` lists at least one queue. The observer
+     * is built, bound and started only once the process is detected as
+     * long-running, so a short artisan command or a per-request SAPI (even
+     * with `metrics.fpm` on) never queries a queue or touches the lock.
+     *
+     * @return object{observer: ?QueueBacklogObserver} filled at detection
+     */
+    private function registerQueueBacklog(Metrics $metrics): object
+    {
+        $backlog = new class
+        {
+            public ?QueueBacklogObserver $observer = null;
+        };
+
+        $app = $this->app;
+        $config = (array) $app['config']->get('apm', []);
+        $queues = QueueBacklogObserver::configuredQueues($config);
+
+        if ($queues === []) {
+            return $backlog;
+        }
+
+        $metrics->whenLongRunning(static function () use ($app, $config, $queues, $metrics, $backlog): void {
+            // A process that drives its own collects (torque's master) never
+            // reports the backlog. When collectDue() only follows, the
+            // observer stops itself then (see QueueBacklogObserver::start()).
+            if ($metrics->selfDriven()) {
+                return;
+            }
+
+            $lockStore = $config['metrics']['queue_backlog']['lock_store'] ?? null;
+
+            $backlog->observer = new QueueBacklogObserver(
+                $app->make('queue'),
+                $queues,
+                static fn (): Repository => $app->make('cache')->store(is_string($lockStore) && $lockStore !== '' ? $lockStore : null),
+                QueueBacklogObserver::lockKeyFor($config),
+                $metrics->interval(),
+                $app->bound(ThrottledLogWriter::class) ? $app->make(ThrottledLogWriter::class) : null,
+                $app->make(FiberContextStorage::class),
+            );
+
+            $app->instance(QueueBacklogObserver::class, $backlog->observer);
+            $backlog->observer->start($metrics);
+        });
+
+        return $backlog;
+    }
+
+    /**
+     * The loop, runtime and database pool instruments (see RuntimeObserver),
+     * each behind its own `metrics.groups.*` toggle. Built, bound and
+     * started only once the process is detected as long-running.
+     *
+     * @return object{observer: ?RuntimeObserver} filled at detection
+     */
+    private function registerRuntime(Metrics $metrics): object
+    {
+        $runtime = new class
+        {
+            public ?RuntimeObserver $observer = null;
+        };
+
+        $app = $this->app;
+        $groups = RuntimeObserver::groups((array) $app['config']->get('apm', []));
+
+        if (! in_array(true, $groups, true)) {
+            return $runtime;
+        }
+
+        $metrics->whenLongRunning(static function () use ($app, $groups, $metrics, $runtime): void {
+            $runtime->observer = new RuntimeObserver($groups['loop'], $groups['runtime'], $groups['database_pool']);
+
+            $app->instance(RuntimeObserver::class, $runtime->observer);
+            $runtime->observer->start($metrics);
+        });
+
+        return $runtime;
     }
 
     /**

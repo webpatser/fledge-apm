@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Fledge\Apm\Metrics;
 
+use Closure;
 use Fledge\Apm\Context\FiberContextStorage;
 use Fledge\Apm\Export\ExportCircuitBreaker;
 use Fledge\Apm\TracerFactory;
@@ -17,6 +18,7 @@ use OpenTelemetry\API\Metrics\Noop\NoopMeter;
 use OpenTelemetry\API\Metrics\Noop\NoopMeterProvider;
 use OpenTelemetry\Context\Context;
 use OpenTelemetry\SDK\Metrics\MetricExporterInterface;
+use Psr\Log\LogLevel;
 use Throwable;
 use WeakReference;
 
@@ -29,6 +31,7 @@ use function Fledge\Async\async;
  *     $histogram = Metrics::meter('my-package')->createHistogram('x.duration', 's', null, [...]);
  *     $histogram->record($seconds, Metrics::cardinality()->attributes('x.duration', $attributes));
  *     Metrics::markLongRunning('torque');
+ *     Metrics::collectDue(); // only a process without a continuously running loop
  *
  * Callers never branch: meter() returns a no-op meter when APM or metrics
  * are off, when there is no application container, and under a per-request
@@ -40,7 +43,9 @@ use function Fledge\Async\async;
  *   `metrics.interval` on the event loop timer; or an Octane worker under
  *   any SAPI, through RequestReceived (Octane on FrankenPHP is not CLI and
  *   records only with `metrics.fpm` on). It collects every interval and
- *   flushes once more on WorkerStopping and at shutdown.
+ *   flushes once more on WorkerStopping and at shutdown. The interval is
+ *   driven by the loop timer (see startTimer()), by Looping in a queue
+ *   worker, or by the process itself through collectDue().
  * - A non-CLI request with `metrics.fpm` on, not marked long-running: the
  *   request's deltas go out from the terminating callback, after the
  *   response was sent.
@@ -109,6 +114,31 @@ final class Metrics
 
     private bool $longRunning = false;
 
+    /** Marked through markLongRunning() (or detect() with an explicit role). */
+    private bool $marked = false;
+
+    /** The Loop::defer() id that arms the timer on the first loop turn. */
+    private ?string $pendingTimer = null;
+
+    private int|false $pendingPid = false;
+
+    /** @var int|false|null the pid that drives its own collects through collectDue() */
+    private int|false|null $selfDrivenPid = null;
+
+    /** Looping or Octane's RequestReceived fired outside any fiber: the host drives the cadence. */
+    private bool $eventDriven = false;
+
+    /** @var list<Closure(): void> run once when the process turns out to be self-driven */
+    private array $onSelfDriven = [];
+
+    /** @var list<Closure(): void> run once when the process turns out to be event-driven */
+    private array $onEventDriven = [];
+
+    /** @var list<Closure(): void> whenLoopDriven() callbacks from {main} of an unmarked process, held until a detection inside a fiber */
+    private array $heldLoopDriven = [];
+
+    private readonly ?LogWriterInterface $log;
+
     private bool $collecting = false;
 
     /** @var Future<bool>|null */
@@ -119,6 +149,9 @@ final class Metrics
     private int $lastCollect;
 
     private ?MeterProviderInterface $noop = null;
+
+    /** @var list<Closure(): void> run once at long-running detection */
+    private array $onLongRunning = [];
 
     /**
      * @param  array<string, mixed>  $config  the `apm` config array
@@ -144,6 +177,7 @@ final class Metrics
         $this->interval = max(1, (int) ($metrics['interval'] ?? 60));
         $this->resetGuardPerCollect = ! in_array(strtolower((string) ($metrics['temporality'] ?? 'delta')), ['cumulative', 'lowmemory'], true);
         $this->guard = new CardinalityGuard(max(1, (int) ($metrics['cardinality_limit'] ?? 200)), $log);
+        $this->log = $log;
         $this->lastCollect = hrtime(true);
     }
 
@@ -173,10 +207,55 @@ final class Metrics
      * Mark this CLI process as long-running, so it exports every interval,
      * and set `fledge.process.role` (e.g. "torque", "resonate"). Overrides a
      * role detected from queue or Octane events. Ignored outside CLI.
+     *
+     * The interval runs on an unreferenced Fledge event loop timer. Called
+     * inside a fiber of the running loop, the timer starts now; called from
+     * {main} (before Loop::run(), or between awaits), the start is queued
+     * once (an unreferenced Loop::defer(), which neither starts a loop nor
+     * keeps one alive) and the timer arms on the next loop turn, if a loop
+     * ever turns. A process that never runs a loop gets no timer. A process
+     * that calls collectDue() never gets one either (see there), and neither
+     * does a stock queue worker (Looping fired outside any fiber).
      */
     public static function markLongRunning(string $role): void
     {
         self::current()?->detect($role, explicit: true);
+    }
+
+    /**
+     * Collect and export now when due, for a long-running process that has
+     * no continuously running event loop and drives the interval itself
+     * (torque's master calls it from its maintenance tick). Never throws.
+     *
+     * Returns false and does nothing unless metrics are recording, the
+     * process is long-running (markLongRunning() or a detection signal),
+     * the final flush has not run, no collect is in flight, and at least
+     * `metrics.interval` seconds passed since the last collect (or since
+     * boot). Otherwise it collects at the root context, waits until the
+     * export finished (bounded by the OTLP request timeouts, no retries)
+     * and returns whether the export succeeded. From {main} the wait drives
+     * the event loop until the export completes (starting it when it does
+     * not run, as the final flush does); inside a fiber of a running loop
+     * it suspends only that fiber.
+     *
+     * Timer opt-out: the first call in a process with metrics recording,
+     * due or not and before or after markLongRunning(), cancels this
+     * process's loop timer and a queued timer start, and no loop timer
+     * starts for this process afterwards (forked children are not
+     * affected). From then on only collectDue(), Looping and the final
+     * flush export. Call it every second or so: an interval only goes out
+     * on the first call after it elapsed. The queue backlog observer and the
+     * loop group of the runtime observer stop in such a process (whichever
+     * of markLongRunning() and collectDue() comes first): it reports neither
+     * the queue backlog nor loop metrics.
+     */
+    public static function collectDue(): bool
+    {
+        try {
+            return self::current()?->driveCollect() ?? false;
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     /**
@@ -273,12 +352,215 @@ final class Metrics
             $this->role = $role;
         }
 
+        if ($explicit) {
+            $this->marked = true;
+        }
+
         if (! $this->longRunning) {
             $this->longRunning = true;
             self::registerShutdown($this);
+            $this->runOnce($this->onLongRunning);
+        }
+
+        // Inside a fiber (torque's Looping or its recordWorker()) the held
+        // callbacks run now; an explicit mark from {main} queues them for
+        // the next loop turn.
+        if ($this->heldLoopDriven !== [] && (\Fiber::getCurrent() !== null || $this->marked)) {
+            $held = $this->heldLoopDriven;
+            $this->heldLoopDriven = [];
+
+            foreach ($held as $callback) {
+                $this->whenLoopDriven($callback);
+            }
         }
 
         $this->startTimer();
+    }
+
+    /**
+     * Run `$callback` once this process is detected as long-running: now
+     * when it already is, never when it records no metrics or never gets
+     * detected (short artisan commands, per-request SAPIs). Exceptions from
+     * the callback are logged through the throttled writer, never thrown.
+     *
+     * @param  Closure(): void  $callback
+     */
+    public function whenLongRunning(Closure $callback): void
+    {
+        if ($this->longRunning && ! $this->finished) {
+            $this->run($callback);
+
+            return;
+        }
+
+        if ($this->recording && ! $this->finished) {
+            $this->onLongRunning[] = $callback;
+        }
+    }
+
+    /**
+     * Run `$callback` once this process turns out to drive its own collects
+     * through collectDue(): now when it already does. Exceptions are logged,
+     * never thrown.
+     *
+     * @param  Closure(): void  $callback
+     */
+    public function whenSelfDriven(Closure $callback): void
+    {
+        if ($this->selfDriven()) {
+            $this->run($callback);
+
+            return;
+        }
+
+        $this->onSelfDriven[] = $callback;
+    }
+
+    /**
+     * Run `$callback` once this process turns out to be event-driven (see
+     * hostEvent()): now when it already is. Observers cancel their loop
+     * timers here. Exceptions are logged, never thrown.
+     *
+     * @param  Closure(): void  $callback
+     */
+    public function whenEventDriven(Closure $callback): void
+    {
+        if ($this->eventDriven) {
+            $this->run($callback);
+
+            return;
+        }
+
+        $this->onEventDriven[] = $callback;
+    }
+
+    /**
+     * This process (this pid) drives its own collects through collectDue():
+     * no loop timers, no queue backlog, no loop metrics.
+     */
+    public function selfDriven(): bool
+    {
+        return $this->selfDrivenPid !== null && $this->selfDrivenPid === getmypid();
+    }
+
+    /**
+     * Looping (a stock queue worker) or Octane's RequestReceived fired
+     * outside any fiber: the host's events drive the cadence, and this
+     * process turns the loop only briefly, from the main context.
+     */
+    public function eventDriven(): bool
+    {
+        return $this->eventDriven;
+    }
+
+    /**
+     * Called by the Looping and RequestReceived listeners. Outside any
+     * fiber it marks the process event-driven, cancels a loop timer and a
+     * queued timer start, drops the held whenLoopDriven() callbacks and runs
+     * the whenEventDriven() ones; inside a fiber (a torque worker fires
+     * Looping from its reader fibers) it does nothing.
+     */
+    public function hostEvent(): void
+    {
+        if ($this->eventDriven || \Fiber::getCurrent() !== null) {
+            return;
+        }
+
+        $this->eventDriven = true;
+        $this->heldLoopDriven = [];
+        $this->stop();
+        $this->runOnce($this->onEventDriven);
+    }
+
+    /**
+     * Whether loop timers belong in this process: neither event-driven nor
+     * self-driven, and the final flush has not run.
+     */
+    public function loopDriven(): bool
+    {
+        return ! $this->eventDriven && ! $this->selfDriven() && ! $this->finished;
+    }
+
+    /**
+     * Run `$callback` inside a fiber of the running loop while this process
+     * is loop-driven: now when a fiber is current. From {main} of a process
+     * marked through markLongRunning() it runs on the next loop turn
+     * through one unreferenced Loop::defer() (which neither starts a loop
+     * nor keeps one alive), re-checking loopDriven() when it runs. From
+     * {main} of an unmarked process it is held until markDetected() runs
+     * inside a fiber, because a stock worker turns the loop from {main}
+     * before its first Looping (signal watchers) and must arm nothing
+     * there; hostEvent() drops it. Nothing in an event-driven or self-driven
+     * process. Returns the defer id, for the caller to cancel, or null when
+     * nothing was queued.
+     *
+     * @param  Closure(): void  $callback
+     */
+    public function whenLoopDriven(Closure $callback): ?string
+    {
+        if (! $this->loopDriven()) {
+            return null;
+        }
+
+        if (\Fiber::getCurrent() !== null) {
+            $this->run($callback);
+
+            return null;
+        }
+
+        if (! $this->marked) {
+            $this->heldLoopDriven[] = $callback;
+
+            return null;
+        }
+
+        $owner = WeakReference::create($this);
+
+        try {
+            return Loop::unreference(Loop::defer(static function () use ($owner, $callback): void {
+                $metrics = $owner->get();
+
+                if ($metrics !== null && $metrics->loopDriven()) {
+                    $metrics->run($callback);
+                }
+            }));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  Closure(): void  $callback
+     */
+    private function run(Closure $callback): void
+    {
+        try {
+            $callback();
+        } catch (Throwable $e) {
+            // A hook must never break detection; it is logged, throttled.
+            try {
+                $this->log?->write(LogLevel::WARNING, sprintf('fledge-apm: a metrics hook failed: %s: %s', $e::class, mb_substr($e->getMessage(), 0, 200)), []);
+            } catch (Throwable) {
+                // Logging must never break detection either.
+            }
+        }
+    }
+
+    /**
+     * Empty a hook list, then run what it held.
+     *
+     * @param  list<Closure(): void>  $callbacks
+     *
+     * @param-out list<Closure(): void>  $callbacks
+     */
+    private function runOnce(array &$callbacks): void
+    {
+        $pending = $callbacks;
+        $callbacks = [];
+
+        foreach ($pending as $callback) {
+            $this->run($callback);
+        }
     }
 
     /**
@@ -286,8 +568,10 @@ final class Metrics
      * when skipped: the process does not export (yet), nothing was ever
      * recorded, a collect is in flight, or the final flush already ran.
      *
-     * With `$await` false and a running event loop the export continues in
-     * the background; without a running loop it is always awaited.
+     * With `$await` false inside a fiber the export continues in the
+     * background; from {main} it is always awaited (a background fiber
+     * queued there would only run at the next loop turn, and a stock queue
+     * worker turns the loop only briefly, from the main context).
      */
     public function collect(bool $await = true): bool
     {
@@ -329,7 +613,7 @@ final class Metrics
         // finish inline, wait() on the settled future returns at once.
         $this->inFlight = $future;
 
-        if ($await || ! self::loopRunning()) {
+        if ($await || \Fiber::getCurrent() === null) {
             return self::settle($future);
         }
 
@@ -348,6 +632,26 @@ final class Metrics
         }
 
         return $this->collect($await);
+    }
+
+    /**
+     * collectDue(): opt this process out of the loop timer, then an awaited
+     * collectIfDue() when long-running.
+     */
+    private function driveCollect(): bool
+    {
+        if (! $this->recording || $this->finished) {
+            return false;
+        }
+
+        if (! $this->selfDriven()) {
+            $this->selfDrivenPid = getmypid();
+            $this->heldLoopDriven = [];
+            $this->stop();
+            $this->runOnce($this->onSelfDriven);
+        }
+
+        return $this->longRunning && $this->collectIfDue(await: true);
     }
 
     /**
@@ -401,18 +705,43 @@ final class Metrics
     }
 
     /**
-     * One unreferenced repeat timer per process at `metrics.interval`, only
-     * while the Fledge event loop runs: it never starts a loop and never
-     * keeps one alive, so a short command exits without waiting for it. The
-     * first tick marks the process long-running (it survived one interval);
-     * every tick starts a background collect. A newer instance (a new
-     * application in tests) replaces the timer.
+     * One unreferenced repeat timer per process at `metrics.interval`, armed
+     * only inside a fiber of the running Fledge event loop: it never starts
+     * a loop and never keeps one alive, so a short command exits without
+     * waiting for it. The first tick marks the process long-running (it
+     * survived one interval); every due tick starts a background collect. A
+     * newer instance (a new application in tests) replaces the timer.
+     *
+     * Called from {main} by a process marked through markLongRunning(), the
+     * start is queued once with an unreferenced Loop::defer(): it arms on
+     * the next loop turn, and a loop with nothing else to do never runs it.
+     * Nothing starts in a process that drives its own collects through
+     * collectDue() or whose cadence comes from Looping or Octane events
+     * fired outside any fiber (see loopDriven()).
      */
     public function startTimer(): void
     {
-        if (! $this->recording || ! ($this->cli || $this->longRunning) || $this->finished || self::$timerOwner?->get() === $this || ! self::loopRunning()) {
+        if (! $this->timerAllowed() || self::$timerOwner?->get() === $this) {
             return;
         }
+
+        if (\Fiber::getCurrent() === null) {
+            $this->deferTimer();
+
+            return;
+        }
+
+        $this->armTimer();
+    }
+
+    private function timerAllowed(): bool
+    {
+        return $this->recording && ($this->cli || $this->longRunning) && $this->loopDriven();
+    }
+
+    private function armTimer(): void
+    {
+        $this->cancelPendingTimer();
 
         if (self::$timer !== null) {
             Loop::cancel(self::$timer);
@@ -426,10 +755,12 @@ final class Metrics
     }
 
     /**
-     * Cancel this instance's collect timer.
+     * Cancel this instance's collect timer and a queued timer start.
      */
     public function stop(): void
     {
+        $this->cancelPendingTimer();
+
         if (self::$timer === null || self::$timerOwner?->get() !== $this) {
             return;
         }
@@ -439,10 +770,87 @@ final class Metrics
         self::$timerOwner = null;
     }
 
+    /**
+     * Queue startTimer() for the first loop turn, once, in a CLI process
+     * marked long-running. Detection through worker or Octane events queues
+     * nothing: those processes collect on Looping or after each request.
+     */
+    private function deferTimer(): void
+    {
+        if (! $this->cli || ! $this->longRunning || ! $this->marked) {
+            return;
+        }
+
+        if ($this->pendingTimer !== null) {
+            if ($this->pendingPid === getmypid()) {
+                return;
+            }
+
+            $this->pendingTimer = null; // inherited through fork(): the child's driver never had it
+        }
+
+        $owner = WeakReference::create($this);
+        $this->pendingPid = getmypid();
+
+        try {
+            $this->pendingTimer = Loop::unreference(Loop::defer(static function () use ($owner): void {
+                $metrics = $owner->get();
+
+                if ($metrics === null) {
+                    return;
+                }
+
+                $metrics->pendingTimer = null;
+
+                try {
+                    // A loop turn inside a fiber: arm here, never queue again.
+                    if ($metrics->timerAllowed() && self::$timerOwner?->get() !== $metrics) {
+                        $metrics->armTimer();
+                    }
+                } catch (Throwable) {
+                    // A loop callback must not throw into the loop.
+                }
+            }));
+        } catch (Throwable) {
+            $this->pendingTimer = null;
+        }
+    }
+
+    private function cancelPendingTimer(): void
+    {
+        if ($this->pendingTimer === null) {
+            return;
+        }
+
+        try {
+            Loop::cancel($this->pendingTimer);
+        } catch (Throwable) {
+            // Gone with the driver (a fork replaced it).
+        }
+
+        $this->pendingTimer = null;
+    }
+
+    /**
+     * One timer firing: stops the timer once the process turned out to be
+     * event-driven or self-driven; otherwise detects and collects when due,
+     * with a tenth of an interval of slack, so a tick right after a Looping
+     * or collectDue() collect does not export the gauges twice.
+     */
     private function tick(): void
     {
+        if (! $this->loopDriven()) {
+            $this->stop();
+
+            return;
+        }
+
         if (! $this->longRunning) {
             $this->detect();
+        }
+
+        if (hrtime(true) - $this->lastCollect < $this->interval * 900_000_000) {
+            return;
         }
 
         $this->collect(await: false);
@@ -502,15 +910,6 @@ final class Metrics
     {
         try {
             return (bool) $future->await();
-        } catch (Throwable) {
-            return false;
-        }
-    }
-
-    private static function loopRunning(): bool
-    {
-        try {
-            return Loop::getDriver()->isRunning();
         } catch (Throwable) {
             return false;
         }

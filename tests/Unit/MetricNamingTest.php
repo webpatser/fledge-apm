@@ -45,6 +45,20 @@ it('finds the instruments of this release in the source', function () {
         'fledge.queue.job.wait_time',
         'fledge.queue.job.retries',
         'fledge.queue.job.failures',
+        'fledge.queue.pending',
+        'fledge.queue.delayed',
+        'fledge.queue.reserved',
+        'fledge.queue.oldest_age',
+        'fledge.loop.lag',
+        'fledge.loop.watchers',
+        'fledge.php.memory.usage',
+        'fledge.php.memory.peak',
+        'fledge.php.gc.runs',
+        'fledge.php.gc.collected',
+        'fledge.php.gc.duration',
+        'db.client.connection.count',
+        'db.client.connection.max',
+        'db.client.connection.pending_requests',
     );
 });
 

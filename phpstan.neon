@@ -3,3 +3,10 @@ parameters:
     paths:
         - src
     tmpDir: .phpstan.cache
+    ignoreErrors:
+        # The pool registry exists only in newer fledge-fiber releases; the
+        # observer checks for it at runtime (poolRegistryAvailable()).
+        -
+            message: '#Fledge\\Fiber\\Database\\PoolStats(Registry)?\b#'
+            path: src/Metrics/RuntimeObserver.php
+            reportUnmatched: false

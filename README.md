@@ -126,13 +126,22 @@ Next to the traces the package can export OTLP metrics. They are off until you s
 | `apm.metrics.fpm` | `APM_METRICS_FPM` | `false` | Record metrics under per-request (non-CLI) SAPIs such as PHP-FPM and export each request's metrics. |
 | `apm.metrics.groups.http_client` | none | `true` | HTTP client instruments. |
 | `apm.metrics.groups.queue` | none | `true` | Job instruments. |
-| `apm.metrics.groups.queue_backlog`, `runtime`, `database_pool`, `loop` | none | `true` | Reserved for later releases. |
-| `apm.metrics.queue_backlog.queues`, `lock_store` | none | `[]`, `null` | Reserved for later releases. |
+| `apm.metrics.groups.queue_backlog` | none | `true` | Queue backlog gauges (see below). |
+| `apm.metrics.groups.runtime` | none | `true` | PHP memory and garbage collector instruments (see Runtime, loop and pool). |
+| `apm.metrics.groups.loop` | none | `true` | Event loop lag and watcher instruments; need a running event loop. |
+| `apm.metrics.groups.database_pool` | none | `true` | Database connection pool instruments; need a fledge-fiber release with the pool registry. |
+| `apm.metrics.queue_backlog.queues` | none | `[]` | Connection name to queue names whose backlog is reported. Empty reports nothing. |
+| `apm.metrics.queue_backlog.lock_store` | none | `null` | Cache store for the lock that picks the one reporting process; `null` for the default store. |
 | `apm.otlp.metrics_endpoint` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | none | Full metrics URL, wins over the base endpoint. |
 
-Process model. A long-running process (a queue worker, an Octane worker, a daemon marked with `Metrics::markLongRunning()`, or any CLI process that is still alive after one interval on the event loop) exports every `APM_METRICS_INTERVAL` seconds and once more when it stops. A short artisan command exports nothing and never waits at exit. An interval without a single data point sends nothing.
+Process model. A long-running process (a queue worker, an Octane worker, a daemon marked with `Metrics::markLongRunning()`, or a CLI process that runs its work inside fibers of the Fledge event loop and is still alive after one interval) exports every `APM_METRICS_INTERVAL` seconds and once more when it stops. A short artisan command exports nothing and never waits at exit. An interval without a single data point sends nothing.
 
-`APM_METRICS_FPM` covers per-request (non-CLI) SAPIs such as PHP-FPM. With it off nothing is recorded there; with it on each request's values go out after the response was sent. Each such request builds its own meter provider; the resource detectors it shares with the tracer run once per request. Octane on FrankenPHP is not a CLI process either, so it needs `APM_METRICS_FPM` to record; its first request then marks the worker long-running, and it exports every interval instead of per request.
+Other packages record through `Fledge\Apm\Metrics\Metrics`, whose static methods are no-ops while metrics are off: `meter($scope)`, `enabled()`, `cardinality()`, `markLongRunning($role)` and `collectDue()`.
+
+- `markLongRunning($role)` marks a CLI daemon long-running and sets `fledge.process.role`. The interval runs on an unreferenced event loop timer: called inside a fiber of the running Fledge event loop it starts at once; called from outside any fiber (before `Loop::run()`, or between awaits) it arms on the next loop turn. A stock `queue:work` gets no timer and exports on `Looping` instead: once per interval it waits for the export round trip before its next pop, bounded by `OTEL_EXPORTER_OTLP_TIMEOUT`. A process that never runs a loop gets no timer, and nothing keeps a loop alive or makes the process wait at exit.
+- `collectDue(): bool` is for a long-running process without a continuously running event loop, which drives the interval itself (torque's master calls it every maintenance tick, about once a second). It never throws. It returns false and does nothing unless metrics record, the process is long-running, no collect is in flight and the interval has elapsed since the last collect. Otherwise it collects, waits until the export finished (from outside a loop the wait drives the event loop until then; inside a fiber it suspends only that fiber), bounded by the OTLP request timeouts, and returns whether the export succeeded. The first call opts the process out of the loop timer, due or not: a running or queued timer is cancelled and none starts afterwards, so a loop that only turns briefly never runs background exports. Such a process reports neither the queue backlog nor loop metrics, whichever of `markLongRunning()` and `collectDue()` it calls first; memory, garbage collector and pool gauges still go out.
+
+`APM_METRICS_FPM` covers per-request (non-CLI) SAPIs such as PHP-FPM. With it off nothing is recorded there; with it on each request's values go out after the response was sent. Each such request builds its own meter provider; the resource detectors it shares with the tracer run once per request. Octane on FrankenPHP is not a CLI process either, so it needs `APM_METRICS_FPM` to record; its first request then marks the worker long-running, and it exports per interval instead of per request: at the end of the first request after the interval passed, or when the worker stops. An idle Octane worker therefore exports nothing until its next request.
 
 Temporality is delta by default: each export carries what happened since the previous one, so a counter is the sum of its documents. Histograms use explicit bucket boundaries in seconds.
 
@@ -150,6 +159,67 @@ With metrics enabled, traces and metrics both carry `service.instance.id` and `f
 | `fledge.queue.job.failures` | counter | `{job}` | as above, plus `error.type` |
 
 `error.type` is the exception class short name, or the status code for a response the client span marks as an error (5xx, and 4xx with `error_on_4xx`). URLs, paths and job ids are never attributes. The HTTP and job metrics are recorded whether or not the span is sampled, and `options.http_client.timings` does not affect them, but only while `apm.instrumentation.http_client` and `apm.instrumentation.queue` are on. Wait time is measured from the dispatch on the first attempt only, so a `later()` delay is included; sync queue jobs run inside the dispatch and record no wait time metric.
+
+### Queue backlog
+
+List the queues to watch, per queue connection:
+
+```php
+// config/apm.php
+'metrics' => [
+    // ...
+    'queue_backlog' => [
+        'queues' => [
+            'redis' => ['default', 'mail'],
+            'database' => ['reports'],
+        ],
+        'lock_store' => 'redis', // null for the default cache store
+    ],
+],
+```
+
+| Instrument | Kind | Unit | Attributes |
+|---|---|---|---|
+| `fledge.queue.pending` | gauge | `{job}` | `messaging.system`, `messaging.destination.name`, `laravel.queue.connection` |
+| `fledge.queue.delayed` | gauge | `{job}` | as above |
+| `fledge.queue.reserved` | gauge | `{job}` | as above |
+| `fledge.queue.oldest_age` | gauge | `s` | as above |
+
+Each comes from the queue driver's `pendingSize`, `delayedSize`, `reservedSize` and `creationTimeOfOldestPendingJob` (the same numbers `queue:monitor` uses); `oldest_age` is now minus the creation time of the oldest pending job and is absent, not zero, while nothing is pending. A driver without one of these methods skips that gauge. Nothing is queried while `queues` is empty, with `groups.queue_backlog` off, or in a process that is not long-running (short artisan commands, PHP-FPM, even with `APM_METRICS_FPM`).
+
+At most one process reports. Every long-running process samples once per interval, but only the holder of a cache lock (key `fledge-apm:queue-backlog:{service}:{environment}`, so apps and environments sharing a cache store do not block each other) queries the queues. The holder renews the lock by owner every interval with a TTL of the interval plus half an interval of grace (2 to 30 seconds), so it stays the reporter for as long as it lives. It reports only while its own lease is valid, which ends half the grace (at least one second) before the TTL, because database, DynamoDB and file locks expire on whole seconds. A worker that stops cleanly releases the lock and a standby takes over within one interval; after a holder dies the series has a gap of up to about one TTL plus one interval, until a standby takes the expired lock.
+
+When the values are sampled:
+
+- Stock `queue:work`: on `Looping`, once per interval, so the queries run between jobs and delay the next pop by their duration, as does the metrics export that follows (bounded by `OTEL_EXPORTER_OTLP_TIMEOUT`).
+- Event-loop processes (torque workers, the Fledge server, daemons): on an unreferenced timer, each sample in its own fiber. The timer arms inside a fiber of the running loop, or on the first loop turn for a daemon marked before `Loop::run()`. Nothing arms in a stock `queue:work`, not even during the loop turn it takes for its signal watchers before the first `Looping`.
+- Octane: from the terminating callback, after the response was sent, once per interval (the first sample too).
+- A process that drives its own collects through `Metrics::collectDue()` (torque's master) never samples the queues and never takes the lock.
+
+Samples never run inside the metrics export. After the first failure on a connection its remaining queues are skipped for that sample, so a down database or Redis costs one connect timeout and one throttled log line per interval, plus that connection's points. The numbers are up to one interval old.
+
+Use a lock store all workers share (`redis`, `database`, `memcached`, `dynamodb`; `file` only on a single host). A store without lock support, and the `null` store, report nothing at all and log a warning, because every worker reporting would multiply the series. The `array` store is per process, so with it every worker reports.
+
+### Runtime, loop and pool
+
+Three independent groups, each behind its own toggle, created once the process is detected as long-running (never in a short artisan command or a per-request SAPI).
+
+| Instrument | Kind | Unit | Attributes |
+|---|---|---|---|
+| `fledge.loop.lag` | histogram, boundaries 0.0005 to 2.5 | `s` | none |
+| `fledge.loop.watchers` | gauge | `{watcher}` | `fledge.loop.watcher.type` (`defer`, `delay`, `repeat`, `readable`, `writable`, `signal`) |
+| `fledge.php.memory.usage` | gauge | `By` | none |
+| `fledge.php.memory.peak` | gauge | `By` | none |
+| `fledge.php.gc.runs` | counter | `{run}` | none |
+| `fledge.php.gc.collected` | counter | `{object}` | none |
+| `fledge.php.gc.duration` | counter | `s` | none |
+| `db.client.connection.count` | gauge | `{connection}` | `db.client.connection.pool.name`, `db.client.connection.state` (`idle`, `used`) |
+| `db.client.connection.max` | gauge | `{connection}` | `db.client.connection.pool.name` |
+| `db.client.connection.pending_requests` | gauge | `{request}` | `db.client.connection.pool.name` |
+
+- Loop (`groups.loop`) records only in a process driven by the Fledge event loop. `fledge.loop.lag` is the drift of an unreferenced one second repeat timer: the moment it fired minus the moment it was due, never below zero. The timer never keeps a loop alive; it arms inside a fiber of the running loop, or on the first loop turn for a daemon marked before `Loop::run()`. A stock `queue:work` (which turns the loop only briefly, from the main context), an Octane worker that receives requests outside any fiber, and a process that drives its own collects through `Metrics::collectDue()` record no loop metrics. `fledge.loop.watchers` counts every registered, non-cancelled event loop callback by type, disabled and unreferenced ones and fledge-apm's own timers included; every type is reported, zero included.
+- Runtime (`groups.runtime`) works with or without an event loop. Memory is the size allocated from the system (`memory_get_usage(true)`, `memory_get_peak_usage(true)`). The garbage collector instruments read the cumulative `gc_status()` numbers (`runs`, `collected`, and `collector_time` in seconds, left out on a PHP without it); the SDK exports the change per interval.
+- Pools (`groups.database_pool`) come from the fledge-fiber pool registry and need a fledge-fiber release that has it; with an older release these instruments do not exist. Several live pools can share one connection name (read/write split, per-task connections), so the numbers are summed per name; `used` is open connections minus idle ones.
 
 ## Privacy defaults
 

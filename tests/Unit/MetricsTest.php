@@ -6,6 +6,8 @@ use Fledge\Apm\Metrics\CardinalityGuard;
 use Fledge\Apm\Metrics\Metrics;
 use Fledge\Apm\Tests\Fixtures\Metrics\SlowMetricExporter;
 use Fledge\Apm\TracerFactory;
+use Fledge\Loop;
+use Fledge\Loop\CallbackType;
 use OpenTelemetry\API\Metrics\Noop\NoopMeter;
 use OpenTelemetry\API\Metrics\Noop\NoopMeterProvider;
 use OpenTelemetry\SDK\Metrics\Data\Metric;
@@ -14,6 +16,7 @@ use OpenTelemetry\SDK\Metrics\MetricExporter\InMemoryExporter;
 use OpenTelemetry\SDK\Metrics\MetricExporterInterface;
 use OpenTelemetry\SDK\Metrics\TemporalityPreference;
 
+use function Fledge\Async\async;
 use function Fledge\Async\delay;
 
 /**
@@ -143,6 +146,8 @@ it('serves the static API from the container instance', function () {
         ->and($metrics->collect())->toBeTrue()
         ->and(exportedSum($exporter->collect(), 'fledge.test.count'))->toBe(7)
         ->and($exporter->collect()[0]->resource->getAttributes()->get(TracerFactory::PROCESS_ROLE))->toBe('resonate');
+
+    $metrics->stop();
 });
 
 it('never runs two collects at once', function () {
@@ -155,7 +160,8 @@ it('never runs two collects at once', function () {
 
     $counter->add(1);
 
-    expect($metrics->collect(await: false))->toBeTrue()
+    // A background collect is started inside a fiber; from {main} it is awaited.
+    expect(async(fn (): bool => $metrics->collect(await: false))->await())->toBeTrue()
         ->and($metrics->collect(await: false))->toBeFalse()
         ->and($metrics->collect())->toBeFalse();
 
@@ -166,7 +172,7 @@ it('never runs two collects at once', function () {
 
     // The final flush waits for an in-flight collect instead of overlapping it.
     $counter->add(2);
-    $metrics->collect(await: false);
+    async(fn (): bool => $metrics->collect(await: false))->await();
 
     expect($metrics->finish())->toBeTrue()
         ->and($slow->exports)->toBe(3)
@@ -198,4 +204,199 @@ it('resets the cardinality guard per collect only with delta temporality', funct
     $cumulative->collect();
 
     expect($cumulative->guard()->attributes('fledge.test.count', ['k' => 'b']))->toBe(CardinalityGuard::OVERFLOW);
+});
+
+/**
+ * Bring the event loop back to "not running", as in a process that never
+ * awaited anything: an earlier await from {main} leaves the loop fiber
+ * suspended (running); run() resumes it and it returns once nothing
+ * referenced is left.
+ */
+function stopEventLoop(): void
+{
+    if (Loop::getDriver()->isRunning()) {
+        $referenced = array_filter(Loop::getIdentifiers(), fn (string $id): bool => Loop::isEnabled($id) && Loop::isReferenced($id));
+
+        expect($referenced)->toBe([]); // run() would wait for these
+
+        Loop::run();
+    }
+
+    expect(Loop::getDriver()->isRunning())->toBeFalse();
+}
+
+/**
+ * Unreferenced repeat timers on the event loop.
+ *
+ * @return list<string>
+ */
+function metricsRepeatTimers(): array
+{
+    return array_values(array_filter(
+        Loop::getIdentifiers(),
+        fn (string $id): bool => Loop::getType($id) === CallbackType::Repeat && Loop::isEnabled($id) && ! Loop::isReferenced($id),
+    ));
+}
+
+/**
+ * Move the last collect `$seconds` back, so the interval has elapsed.
+ */
+function backdateCollect(Metrics $metrics, int $seconds = 61): void
+{
+    (function () use ($seconds): void {
+        $this->lastCollect = hrtime(true) - $seconds * 1_000_000_000;
+    })->call($metrics);
+}
+
+it('collectDue() does nothing unless metrics record, the process is long-running and the interval elapsed', function () {
+    expect(Metrics::collectDue())->toBeFalse(); // APM off
+
+    [$disabled] = metricsRuntime(['metrics' => ['enabled' => false]]);
+    app()->instance(Metrics::class, $disabled);
+
+    expect(Metrics::collectDue())->toBeFalse();
+
+    [$short, $shortExporter] = metricsRuntime();
+    app()->instance(Metrics::class, $short);
+    Metrics::meter('tests')->createCounter('fledge.test.count')->add(1);
+    backdateCollect($short);
+
+    expect(Metrics::collectDue())->toBeFalse() // not long-running
+        ->and($shortExporter->collect())->toBe([]);
+
+    [$marked, $exporter] = metricsRuntime();
+    app()->instance(Metrics::class, $marked);
+    Metrics::markLongRunning('torque');
+    Metrics::meter('tests')->createCounter('fledge.test.count')->add(1);
+
+    expect(Metrics::collectDue())->toBeFalse() // the interval has not elapsed
+        ->and($exporter->collect())->toBe([]);
+
+    $short->stop();
+    $marked->stop();
+});
+
+it('collectDue() exports once due and waits for the export outside a running loop', function () {
+    stopEventLoop(); // torque's master between its awaits
+
+    $slow = new SlowMetricExporter(0.2);
+    [$metrics] = metricsRuntime(exporter: $slow);
+    app()->instance(Metrics::class, $metrics);
+    Metrics::markLongRunning('torque');
+    Metrics::meter('tests')->createCounter('fledge.test.count')->add(2);
+    backdateCollect($metrics);
+
+    expect(Metrics::collectDue())->toBeTrue()
+        ->and($slow->exports)->toBe(1) // finished before collectDue() returned
+        ->and(exportedSum($slow->metrics, 'fledge.test.count'))->toBe(2)
+        ->and($slow->metrics[0]->resource->getAttributes()->get(TracerFactory::PROCESS_ROLE))->toBe('torque')
+        ->and(Metrics::collectDue())->toBeFalse(); // the next interval starts now
+
+    $metrics->stop();
+});
+
+it('collectDue() never overlaps a collect in flight', function () {
+    delay(0); // a running event loop
+
+    $slow = new SlowMetricExporter(0.2);
+    [$metrics] = metricsRuntime(exporter: $slow);
+    app()->instance(Metrics::class, $metrics);
+    Metrics::markLongRunning('torque');
+    Metrics::meter('tests')->createCounter('fledge.test.count')->add(1);
+
+    expect(async(fn (): bool => $metrics->collect(await: false))->await())->toBeTrue();
+
+    backdateCollect($metrics);
+
+    expect(Metrics::collectDue())->toBeFalse();
+
+    $metrics->wait();
+
+    expect($slow->exports)->toBe(1)
+        ->and($slow->maxActive)->toBe(1);
+
+    $metrics->stop();
+});
+
+it('runs no loop timer in a process that drives its own collects through collectDue()', function () {
+    stopEventLoop();
+
+    [$metrics, $exporter] = metricsRuntime(['metrics' => ['interval' => 1]]);
+    app()->instance(Metrics::class, $metrics);
+    $before = metricsRepeatTimers();
+
+    Metrics::markLongRunning('torque'); // outside the loop, once
+    delay(0); // the master awaits Redis: the queued start arms the timer
+
+    expect(array_diff(metricsRepeatTimers(), $before))->toHaveCount(1);
+
+    Metrics::meter('tests')->createCounter('fledge.test.count')->add(3);
+
+    expect(Metrics::collectDue())->toBeFalse() // not due, but opts out of the timer
+        ->and(array_diff(metricsRepeatTimers(), $before))->toBe([]);
+
+    Metrics::markLongRunning('torque');
+    delay(1.3); // the loop turns past an interval
+
+    expect(array_diff(metricsRepeatTimers(), $before))->toBe([])
+        ->and($exporter->collect())->toBe([])
+        ->and(Metrics::collectDue())->toBeTrue()
+        ->and(exportedSum($exporter->collect(), 'fledge.test.count'))->toBe(3);
+
+    $metrics->stop();
+});
+
+it('exports on the interval once the loop runs for a process marked before its loop started', function () {
+    stopEventLoop(); // the resonate server before Loop::run()
+
+    [$metrics, $exporter] = metricsRuntime(['metrics' => ['interval' => 1]]);
+    app()->instance(Metrics::class, $metrics);
+    $before = metricsRepeatTimers();
+
+    Metrics::markLongRunning('resonate');
+    Metrics::meter('tests')->createCounter('fledge.test.count')->add(6);
+
+    expect(metricsRepeatTimers())->toBe($before);
+
+    delay(1.3); // the loop runs: the timer arms on the first turn and fires after one interval
+
+    $exported = $exporter->collect();
+
+    expect(array_diff(metricsRepeatTimers(), $before))->toHaveCount(1)
+        ->and(exportedSum($exported, 'fledge.test.count'))->toBe(6)
+        ->and($exported[0]->resource->getAttributes()->get(TracerFactory::PROCESS_ROLE))->toBe('resonate');
+
+    $metrics->stop();
+
+    expect(array_diff(metricsRepeatTimers(), $before))->toBe([]);
+});
+
+it('starts nothing in a process that never runs a loop', function () {
+    stopEventLoop();
+
+    [$metrics, $exporter] = metricsRuntime(['metrics' => ['interval' => 1]]);
+    $before = metricsRepeatTimers();
+
+    // A queue worker detected through its events queues nothing at all.
+    [$worker] = metricsRuntime(['metrics' => ['interval' => 1]]);
+    $ids = Loop::getIdentifiers();
+    $worker->detect(Metrics::ROLE_QUEUE);
+
+    expect(Loop::getIdentifiers())->toBe($ids);
+
+    $metrics->detect('torque', explicit: true);
+    $metrics->provider()->getMeter('tests')->createCounter('fledge.test.count')->add(1);
+
+    // The queued start keeps no loop alive: run() returns at once and the
+    // loop is not running afterwards, with no timer armed.
+    $start = hrtime(true);
+    Loop::run();
+
+    expect((hrtime(true) - $start) / 1e9)->toBeLessThan(0.5)
+        ->and(Loop::getDriver()->isRunning())->toBeFalse()
+        ->and(metricsRepeatTimers())->toBe($before)
+        ->and($exporter->collect())->toBe([]);
+
+    $metrics->stop();
+    $worker->stop();
 });

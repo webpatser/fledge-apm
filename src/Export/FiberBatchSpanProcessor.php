@@ -224,7 +224,7 @@ final class FiberBatchSpanProcessor implements SpanProcessorInterface
                 break;
             }
 
-            $startedAt = hrtime(true);
+            $startedAt = $deadline->now();
 
             try {
                 $exported = $this->exporter->export($chunk, $deadline)->await();
@@ -233,7 +233,7 @@ final class FiberBatchSpanProcessor implements SpanProcessorInterface
             }
 
             if (! $exported) {
-                $this->recordFailedChunk($deadline, $startedAt, hrtime(true), count($batch) - $remaining);
+                $this->recordFailedChunk($deadline, $startedAt, $deadline->now(), count($batch) - $remaining);
 
                 break;
             }

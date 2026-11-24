@@ -16,27 +16,44 @@ use OpenTelemetry\SDK\Common\Future\CancellationInterface;
  * `$retry` is false on the flushes that run while a worker should be serving
  * (HTTP terminate, queue Looping): one attempt per chunk, nothing more. Only
  * the final flush (WorkerStopping, shutdown) retries, still within budget.
+ *
+ * Everything that times a flush reads `now()`, the monotonic clock in
+ * nanoseconds (`hrtime(true)` unless a clock is given, as tests do).
  */
 final readonly class ExportDeadline implements CancellationInterface
 {
+    /**
+     * @param  (Closure(): int)|null  $clock  monotonic nanoseconds; null for hrtime(true)
+     */
     public function __construct(
         public int $deadlineNanos,
         public bool $retry = false,
+        private ?Closure $clock = null,
     ) {}
 
-    public static function after(int $budgetMilliseconds, bool $retry = false): self
+    /**
+     * @param  (Closure(): int)|null  $clock  monotonic nanoseconds; null for hrtime(true)
+     */
+    public static function after(int $budgetMilliseconds, bool $retry = false, ?Closure $clock = null): self
     {
-        return new self(hrtime(true) + max(0, $budgetMilliseconds) * 1_000_000, $retry);
+        $now = $clock !== null ? $clock() : (int) hrtime(true);
+
+        return new self($now + max(0, $budgetMilliseconds) * 1_000_000, $retry, $clock);
+    }
+
+    public function now(): int
+    {
+        return $this->clock !== null ? ($this->clock)() : (int) hrtime(true);
     }
 
     public function remainingSeconds(): float
     {
-        return max(0.0, ($this->deadlineNanos - hrtime(true)) / 1_000_000_000);
+        return max(0.0, ($this->deadlineNanos - $this->now()) / 1_000_000_000);
     }
 
     public function expired(): bool
     {
-        return hrtime(true) >= $this->deadlineNanos;
+        return $this->now() >= $this->deadlineNanos;
     }
 
     /**

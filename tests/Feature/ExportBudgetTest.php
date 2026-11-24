@@ -95,21 +95,55 @@ function failingExporter(): InMemoryExporter
 }
 
 /**
+ * A monotonic clock in nanoseconds that only moves when a test moves it. The
+ * flush deadline and the processor read it instead of hrtime(true), so a
+ * test about where a chunk ends relative to the deadline cannot be skewed by
+ * the scheduler descheduling the process (a loaded machine overshot the
+ * deadline by more than the processor's 10 ms slack).
+ */
+function manualClock(): object
+{
+    return new class
+    {
+        public int $now = 1_000_000_000_000;
+
+        public function __invoke(): int
+        {
+            return $this->now;
+        }
+
+        public function advance(float $seconds): void
+        {
+            $this->now += (int) round($seconds * 1_000_000_000);
+        }
+    };
+}
+
+/**
+ * Flush within `$budgetMs` on `$clock`, as Tracer::flush() does on hrtime.
+ */
+function flushOnClock(Tracer $tracer, object $clock, int $budgetMs): bool
+{
+    $provider = (new ReflectionProperty($tracer, 'provider'))->getValue($tracer);
+
+    return $provider->forceFlush(ExportDeadline::after($budgetMs, clock: $clock->__invoke(...)));
+}
+
+/**
  * An SDK exporter for a healthy intake with `$latency` seconds per chunk that
  * reads the flush deadline instead of racing it. A chunk that starts with at
- * least `$latency` left is accepted after a busy-wait of exactly `$latency`.
- * A chunk that starts with less is the budget-capped request: it waits until
- * the deadline reports expired and only then fails, so it always ends right
- * at the deadline, however loaded the machine is.
+ * least `$latency` left is accepted after exactly `$latency` on the clock. A
+ * chunk that starts with less is the budget-capped request: it fails exactly
+ * at the deadline.
  */
-function latencyExporter(float $latency): SpanExporterInterface
+function latencyExporter(float $latency, object $clock): SpanExporterInterface
 {
-    return new class($latency) implements SpanExporterInterface
+    return new class($latency, $clock) implements SpanExporterInterface
     {
         /** @var list<float> budget left (seconds) when each chunk started */
         public array $calls = [];
 
-        public function __construct(private readonly float $latency) {}
+        public function __construct(private readonly float $latency, private readonly object $clock) {}
 
         public function export(iterable $batch, ?CancellationInterface $cancellation = null): FutureInterface
         {
@@ -119,18 +153,12 @@ function latencyExporter(float $latency): SpanExporterInterface
             $this->calls[] = $remaining;
 
             if ($remaining < $this->latency) {
-                while (! $cancellation->expired()) {
-                    // spin until the deadline
-                }
+                $this->clock->now = $cancellation->deadlineNanos;
 
                 return new CompletedFuture(false);
             }
 
-            $until = hrtime(true) + (int) ($this->latency * 1_000_000_000);
-
-            while (hrtime(true) < $until) {
-                // spin: the intake's latency
-            }
+            $this->clock->advance($this->latency);
 
             return new CompletedFuture(true);
         }
@@ -280,7 +308,8 @@ it('does not open the breaker when the flush budget runs out after the intake ac
     $breaker = new ExportCircuitBreaker(30, static fn (): Repository => $store, 'fledge-apm:breaker:budget');
 
     // A healthy intake with moderate latency: each chunk takes 150 ms.
-    $exporter = latencyExporter(0.15);
+    $clock = manualClock();
+    $exporter = latencyExporter(0.15, $clock);
 
     $tracer = TracerFactory::make([
         'enabled' => true,
@@ -294,7 +323,7 @@ it('does not open the breaker when the flush budget runs out after the intake ac
 
     // Some chunks fit, the next times out on the budget (it started with
     // less budget than the intake's latency), the rest never start.
-    expect($tracer->flush())->toBeFalse()
+    expect(flushOnClock($tracer, $clock, 400))->toBeFalse()
         ->and(count($exporter->calls))->toBeGreaterThanOrEqual(2)->toBeLessThan(6)
         ->and(end($exporter->calls))->toBeLessThan(0.15)
         ->and($breaker->isOpen())->toBeFalse();
@@ -302,7 +331,7 @@ it('does not open the breaker when the flush budget runs out after the intake ac
     $before = count($exporter->calls);
     $tracer->span('next request', fn () => null);
 
-    expect($tracer->flush())->toBeTrue()
+    expect(flushOnClock($tracer, $clock, 400))->toBeTrue()
         ->and($exporter->calls)->toHaveCount($before + 1);
 });
 
@@ -343,23 +372,25 @@ it('opens the breaker on a fast intake failure in the last moments of the budget
     $breaker = new ExportCircuitBreaker(30, static fn (): Repository => $store, 'fledge-apm:breaker:late-503');
 
     // An SDK exporter that sees the flush deadline: chunk 1 is accepted 6 ms
-    // before it (busy-wait, exact to the microsecond), chunk 2 fails at once
-    // like a fast 503. Guzzle's own per-chunk overhead is too coarse for this.
-    $exporter = new class implements SpanExporterInterface
+    // before it (on the manual clock, exact), chunk 2 fails at once like a
+    // fast 503. Guzzle's own per-chunk overhead is too coarse for this.
+    $clock = manualClock();
+
+    $exporter = new class($clock) implements SpanExporterInterface
     {
         /** @var list<float> budget left (seconds) when chunk 2 started */
         public array $rejectedWith = [];
 
         private int $calls = 0;
 
+        public function __construct(private readonly object $clock) {}
+
         public function export(iterable $batch, ?CancellationInterface $cancellation = null): FutureInterface
         {
             assert($cancellation instanceof ExportDeadline);
 
             if (++$this->calls === 1) {
-                while (hrtime(true) < $cancellation->deadlineNanos - 6_000_000) {
-                    // spin
-                }
+                $this->clock->now = $cancellation->deadlineNanos - 6_000_000;
 
                 return new CompletedFuture(true);
             }
@@ -389,7 +420,7 @@ it('opens the breaker on a fast intake failure in the last moments of the budget
     $tracer->span('accepted', fn () => null);
     $tracer->span('rejected', fn () => null);
 
-    expect($tracer->flush())->toBeFalse()
+    expect(flushOnClock($tracer, $clock, 300))->toBeFalse()
         ->and($exporter->rejectedWith)->toHaveCount(1)
         ->and($exporter->rejectedWith[0])->toBeGreaterThan(0.0)->toBeLessThan(0.01)
         ->and($breaker->isOpen())->toBeTrue();
@@ -438,20 +469,22 @@ it('opens the breaker after three consecutive flushes cut off by the budget, and
     $store = new Repository(new ArrayStore);
     $breaker = new ExportCircuitBreaker(30, static fn (): Repository => $store, 'fledge-apm:breaker:slow-alive');
 
-    // Slow but alive: every chunk takes 150 ms, so with a 300 ms budget the
+    // Slow but alive: every chunk takes 160 ms, so with a 300 ms budget the
     // second chunk of a flush is always cut off by the budget.
+    $clock = manualClock();
+
     $tracer = TracerFactory::make([
         'enabled' => true,
         'keep' => ['slow_ms' => 0],
         'batch' => ['flush_budget_ms' => 300, 'max_export_batch_size' => 1],
-    ], new FiberContextStorage, latencyExporter(0.15), $breaker);
+    ], new FiberContextStorage, latencyExporter(0.16, $clock), $breaker);
 
-    $cutOffFlush = function () use ($tracer): bool {
+    $cutOffFlush = function () use ($tracer, $clock): bool {
         foreach (range(1, 3) as $i) {
             $tracer->span("span {$i}", fn () => null);
         }
 
-        return $tracer->flush();
+        return flushOnClock($tracer, $clock, 300);
     };
 
     expect($cutOffFlush())->toBeFalse()
@@ -461,7 +494,7 @@ it('opens the breaker after three consecutive flushes cut off by the budget, and
     // One span fits: the flush exports everything and resets the count.
     $tracer->span('fits', fn () => null);
 
-    expect($tracer->flush())->toBeTrue()
+    expect(flushOnClock($tracer, $clock, 300))->toBeTrue()
         ->and($cutOffFlush())->toBeFalse()
         ->and($cutOffFlush())->toBeFalse()
         ->and($breaker->isOpen())->toBeFalse()
