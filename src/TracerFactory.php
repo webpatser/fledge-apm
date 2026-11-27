@@ -114,7 +114,7 @@ final class TracerFactory
      */
     public static function sampler(array $config): SamplerInterface
     {
-        $ratio = max(0.0, min(1.0, (float) ($config['sample_rate'] ?? 1.0)));
+        $ratio = clamp((float) ($config['sample_rate'] ?? 1.0), 0.0, 1.0);
 
         $root = match (true) {
             $ratio >= 1.0 => new AlwaysOnSampler,

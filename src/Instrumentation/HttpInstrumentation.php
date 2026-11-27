@@ -303,7 +303,7 @@ final class HttpInstrumentation implements Instrumentation
      */
     private function sampledLocally(string $traceId): bool
     {
-        $ratio = max(0.0, min(1.0, (float) $this->app['config']->get('apm.sample_rate', 1.0)));
+        $ratio = clamp((float) $this->app['config']->get('apm.sample_rate', 1.0), 0.0, 1.0);
 
         if ($ratio >= 1.0) {
             return true;

@@ -243,7 +243,7 @@ final class QueueBacklogObserver
     {
         $interval = max(1, $interval);
 
-        return $interval + min(30, max(2, (int) ceil($interval / 2)));
+        return $interval + clamp((int) ceil($interval / 2), 2, 30);
     }
 
     /**

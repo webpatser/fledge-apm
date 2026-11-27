@@ -2,7 +2,7 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.6.0] - Unreleased
+## [0.6.0] - 2026-11-27
 
 ### Added
 
@@ -18,6 +18,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A stock `queue:work` now waits for the metrics export round trip on `Looping`, once per interval, before its next pop, bounded by `OTEL_EXPORTER_OTLP_TIMEOUT`, instead of leaving the export to a background fiber that would only run during a later loop turn.
 - The collect timer collects only when due, with a tenth of an interval of slack, so a tick right after a `Looping` collect does not export the gauges twice.
 - A failing `Metrics::whenLongRunning()` callback is logged through the throttled writer instead of silently swallowed.
+
+- The trace sample rate and the queue backlog lock grace are bounded with the native PHP 8.6 `clamp()` instead of nested `max()` and `min()`; behaviour is unchanged (the bounds are literals in order).
 
 ### Fixed
 
