@@ -61,7 +61,7 @@ final readonly class ExportDeadline implements CancellationInterface
      */
     public function subscribe(Closure $callback): string
     {
-        return spl_object_hash($callback);
+        return (string) spl_object_id($callback);
     }
 
     public function unsubscribe(string $id): void {}

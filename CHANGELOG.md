@@ -2,6 +2,12 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.1] - 2026-11-27
+
+### Changed
+
+- `ExportDeadline` uses `spl_object_id()` instead of `spl_object_hash()`, which PHP 8.6 deprecates; behaviour is unchanged.
+
 ## [0.6.0] - 2026-11-27
 
 ### Added
